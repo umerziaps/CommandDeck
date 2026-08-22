@@ -1,0 +1,76 @@
+rules_version = '2';
+
+// Command Deck — every document lives under the owner's UID and is
+// readable/writable by nobody else. Paste this into
+// Firebase console → Firestore Database → Rules → Publish.
+//
+// The web app's API key is public (it ships in the GitHub Pages bundle,
+// as Firebase intends). These rules, not the key, are what protect the
+// data — so they are the only thing standing between your board and the
+// internet. Read them before publishing.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /users/{userId} {
+
+      // The user document itself (holds nothing but a display name today).
+      allow read, write: if isOwner(userId);
+
+      match /items/{itemId} {
+        allow read, delete: if isOwner(userId);
+        allow create, update: if isOwner(userId) && validItem();
+      }
+
+      match /categories/{categoryId} {
+        allow read, delete: if isOwner(userId);
+        allow create, update: if isOwner(userId) && validCategory();
+      }
+    }
+
+    // Anything not matched above is denied by default. Leave it that way.
+
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+
+    // Shape checks. These are not security-critical — you are the only
+    // writer — but they stop a bug in one client from writing garbage
+    // the other client then has to defend against.
+    function validItem() {
+      let d = request.resource.data;
+      return d.title is string
+          && d.title.size() <= 2000
+          && d.bucket in ['now', 'waiting', 'later']
+          && d.done is bool
+          && d.urgent is bool
+          && d.order is number
+          && d.subs is list
+          && d.subs.size() <= 200;
+    }
+
+    function validCategory() {
+      let d = request.resource.data;
+      return d.name is string
+          && d.name.size() > 0
+          && d.name.size() <= 100
+          && d.color is string
+          && d.color.matches('^#[0-9A-Fa-f]{6}$');
+    }
+  }
+}
+
+// ---------------------------------------------------------------------
+// Optional hardening: once you know your own UID (Firebase console →
+// Authentication → Users), you can pin access to exactly that account so
+// that even a stranger who signs in with Google gets nothing:
+//
+//   function isOwner(userId) {
+//     return request.auth != null
+//         && request.auth.uid == userId
+//         && request.auth.uid == 'PASTE_YOUR_UID_HERE';
+//   }
+//
+// Worth doing. Without it, anyone can sign in and create their own empty
+// board in your project — harmless to your data, but it is your quota.
+// ---------------------------------------------------------------------

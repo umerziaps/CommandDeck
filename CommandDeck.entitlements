@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Deliberately empty.
+
+	  Sync runs through Firestore over ordinary HTTPS, so the app needs no
+	  entitlements at all — which is what lets a free "Personal Team" Apple
+	  account sign and run it. (Apple restricts iCloud and Push Notifications
+	  to the paid Developer Program; nothing here uses either.)
+
+	  Due-date reminders are local notifications, which also need no
+	  entitlement.
+	-->
+</dict>
+</plist>

@@ -1,0 +1,5 @@
+{
+  "//": "Empty on purpose. Both clients read whole collections and sort in memory, so no composite indexes are needed. If you ever add a .where() with an .orderBy() on a different field, Firestore will error with a link that generates the index for you — paste the result here.",
+  "indexes": [],
+  "fieldOverrides": []
+}
