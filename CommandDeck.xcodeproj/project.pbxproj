@@ -3,8 +3,24 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 77;
+	objectVersion = 70;
 	objects = {
+
+/* Begin PBXBuildFile section */
+		86C9F27D303A82DD009ABC33 /* FirebaseAuth in Frameworks */ = {isa = PBXBuildFile; productRef = 86C9F27C303A82DD009ABC33 /* FirebaseAuth */; };
+		86C9F27F303A82DD009ABC33 /* FirebaseFirestore in Frameworks */ = {isa = PBXBuildFile; productRef = 86C9F27E303A82DD009ABC33 /* FirebaseFirestore */; };
+		86C9F282303A8302009ABC33 /* GoogleSignIn in Frameworks */ = {isa = PBXBuildFile; productRef = 86C9F281303A8302009ABC33 /* GoogleSignIn */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		CD10000000000000000000B9 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = CD10000000000000000000A1 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = CD10000000000000000000A4;
+			remoteInfo = CommandDeck;
+		};
+/* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
 		CD10000000000000000000A5 /* CommandDeck.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CommandDeck.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -14,8 +30,8 @@
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
-		CD10000000000000000000A6 /* CommandDeck */ = {isa = PBXFileSystemSynchronizedRootGroup; path = CommandDeck; sourceTree = "<group>"; };
-		CD10000000000000000000A9 /* CommandDeckTests */ = {isa = PBXFileSystemSynchronizedRootGroup; path = CommandDeckTests; sourceTree = "<group>"; };
+		CD10000000000000000000A6 /* CommandDeck */ = {isa = PBXFileSystemSynchronizedRootGroup; explicitFileTypes = {}; explicitFolders = (); path = CommandDeck; sourceTree = "<group>"; };
+		CD10000000000000000000A9 /* CommandDeckTests */ = {isa = PBXFileSystemSynchronizedRootGroup; explicitFileTypes = {}; explicitFolders = (); path = CommandDeckTests; sourceTree = "<group>"; };
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -23,6 +39,9 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				86C9F27D303A82DD009ABC33 /* FirebaseAuth in Frameworks */,
+				86C9F27F303A82DD009ABC33 /* FirebaseFirestore in Frameworks */,
+				86C9F282303A8302009ABC33 /* GoogleSignIn in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -76,6 +95,9 @@
 			);
 			name = CommandDeck;
 			packageProductDependencies = (
+				86C9F27C303A82DD009ABC33 /* FirebaseAuth */,
+				86C9F27E303A82DD009ABC33 /* FirebaseFirestore */,
+				86C9F281303A8302009ABC33 /* GoogleSignIn */,
 			);
 			productName = CommandDeck;
 			productReference = CD10000000000000000000A5 /* CommandDeck.app */;
@@ -133,7 +155,10 @@
 			);
 			mainGroup = CD10000000000000000000A2;
 			minimizedProjectReferenceProxies = 1;
-			preferredProjectObjectVersion = 77;
+			packageReferences = (
+				86C9F27B303A82DD009ABC33 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */,
+				86C9F280303A8302009ABC33 /* XCRemoteSwiftPackageReference "GoogleSignIn-IOS" */,
+			);
 			productRefGroup = CD10000000000000000000A3 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
@@ -177,16 +202,6 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
-
-/* Begin PBXContainerItemProxy section */
-		CD10000000000000000000B9 /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = CD10000000000000000000A1 /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = CD10000000000000000000A4;
-			remoteInfo = CommandDeck;
-		};
-/* End PBXContainerItemProxy section */
 
 /* Begin PBXTargetDependency section */
 		CD10000000000000000000B8 /* PBXTargetDependency */ = {
@@ -321,7 +336,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_ASSET_PATHS = "";
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = GP865MVG9J;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Info.plist;
@@ -350,7 +365,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_ASSET_PATHS = "";
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = GP865MVG9J;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Info.plist;
@@ -439,6 +454,43 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		86C9F27B303A82DD009ABC33 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/firebase/firebase-ios-sdk";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 12.18.0;
+			};
+		};
+		86C9F280303A8302009ABC33 /* XCRemoteSwiftPackageReference "GoogleSignIn-IOS" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/google/GoogleSignIn-IOS";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 9.2.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		86C9F27C303A82DD009ABC33 /* FirebaseAuth */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 86C9F27B303A82DD009ABC33 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */;
+			productName = FirebaseAuth;
+		};
+		86C9F27E303A82DD009ABC33 /* FirebaseFirestore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 86C9F27B303A82DD009ABC33 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */;
+			productName = FirebaseFirestore;
+		};
+		86C9F281303A8302009ABC33 /* GoogleSignIn */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 86C9F280303A8302009ABC33 /* XCRemoteSwiftPackageReference "GoogleSignIn-IOS" */;
+			productName = GoogleSignIn;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = CD10000000000000000000A1 /* Project object */;
 }
