@@ -20,6 +20,12 @@ import {
 } from 'https://www.gstatic.com/firebasejs/12.17.1/firebase-firestore.js';
 
 import { firebaseConfig } from './firebase-config.js';
+import {
+  BUCKETS, CAT_PALETTE, nextColor, uid, esc,
+  todayIso, fmtDate, dueState,
+  normaliseItem, boardOrder, nextOrder, liftedOrder,
+  matchesFilter, visibleItems
+} from './lib.js';
 
 /* ------------------------------------------------------------------ *
  * SCHEMA — keep in lockstep with the Swift side (FirestoreItem.swift)
@@ -46,42 +52,9 @@ import { firebaseConfig } from './firebase-config.js';
 /* ---------- tiny helpers ---------- */
 
 const $ = (id) => document.getElementById(id);
-const uid = (p = 'i') => p + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (m) =>
-  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
 
-const BUCKETS = [
-  { key: 'now',     label: 'Now',     empty: 'Nothing active. Pull something up from Later when you start it.' },
-  { key: 'waiting', label: 'Waiting', empty: 'Not waiting on anyone.' },
-  { key: 'later',   label: 'Later',   empty: 'Captured items land here. Your inbox is clear.' }
-];
-
-const CAT_PALETTE = ['#5EE6C5','#7C89F0','#F0B45E','#FF6B54','#63C7A6',
-                     '#C78BF0','#F07CA8','#8ECF5E','#5EB8E6','#E6C25E'];
-
-const todayIso = () => {
-  const d = new Date();
-  const p = (n) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
-};
-
-function fmtDate(iso) {
-  if (!iso) return '';
-  const d = new Date(iso + 'T00:00:00');
-  const today = new Date(todayIso() + 'T00:00:00');
-  const diff = Math.round((d - today) / 86400000);
-  if (diff === 0) return 'today';
-  if (diff === 1) return 'tomorrow';
-  if (diff === -1) return 'yesterday';
-  if (diff > 1 && diff <= 7) return `in ${diff}d`;
-  if (diff < -1) return `${Math.abs(diff)}d ago`;
-  return d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
-}
-const dueState = (iso) => {
-  if (!iso) return '';
-  const diff = Math.round((new Date(iso + 'T00:00:00') - new Date(todayIso() + 'T00:00:00')) / 86400000);
-  return diff < 0 ? 'over' : (diff <= 2 ? 'soon' : '');
-};
+// uid / esc / date helpers / ordering / filtering all live in lib.js so they
+// can be unit-tested without a DOM or a network. See docs/lib.test.js.
 
 function toast(msg, good) {
   const t = document.createElement('div');
@@ -229,34 +202,11 @@ function subscribe() {
   }, (err) => console.error(err));
 }
 
-/** Fills in anything an older or partial document is missing. */
-function normaliseItem(id, d) {
-  return {
-    id,
-    title: d.title || '',
-    bucket: ['now', 'waiting', 'later'].includes(d.bucket) ? d.bucket : 'later',
-    done: !!d.done,
-    doneAt: d.doneAt || null,
-    waitingOn: d.waitingOn || '',
-    due: d.due || '',
-    subs: Array.isArray(d.subs) ? d.subs : [],
-    catId: d.catId || '',
-    urgent: !!d.urgent,
-    order: typeof d.order === 'number' ? d.order : 0,
-    createdAt: d.createdAt || new Date().toISOString()
-  };
-}
-
 /* ---------- writes ---------- */
 
 // Firestore's offline cache means these resolve locally and sync later, so
 // we deliberately don't await them in the UI path — the snapshot listener
 // re-renders either way.
-
-function nextOrder(bucket) {
-  const peers = state.items.filter((i) => i.bucket === bucket && !i.done);
-  return peers.length ? Math.max(...peers.map((i) => i.order)) + 1 : 0;
-}
 
 function capture() {
   const inp = $('cap-input');
@@ -267,7 +217,7 @@ function capture() {
   const item = {
     title, bucket: 'later', done: false, doneAt: null, waitingOn: '', due: '',
     subs: [], catId: state.catFilter && state.catFilter !== '__uncat__' ? state.catFilter : '',
-    urgent: false, order: nextOrder('later'), createdAt: new Date().toISOString()
+    urgent: false, order: nextOrder(state.items, 'later'), createdAt: new Date().toISOString()
   };
   inp.value = '';
   setDoc(itemRef(id), item).catch(reportWrite);
@@ -290,17 +240,15 @@ function toggleDone(id) {
 function toggleUrgent(id) {
   const it = state.items.find((i) => i.id === id); if (!it) return;
   const fields = { urgent: !it.urgent };
-  if (!it.urgent) {
-    // Marking urgent lifts it to the top of its bucket once — same rule as iOS.
-    const peers = state.items.filter((i) => i.bucket === it.bucket && !i.done && i.id !== id);
-    fields.order = (peers.length ? Math.min(...peers.map((p) => p.order)) : 0) - 1;
-  }
+  // Marking urgent lifts it to the top of its bucket once — same rule as the
+  // iOS and Android clients.
+  if (!it.urgent) fields.order = liftedOrder(state.items, it);
   patch(id, fields);
 }
 
 function moveItem(id, bucket) {
   const it = state.items.find((i) => i.id === id); if (!it || it.bucket === bucket) return;
-  patch(id, { bucket, order: nextOrder(bucket), waitingOn: bucket === 'waiting' ? it.waitingOn : '' });
+  patch(id, { bucket, order: nextOrder(state.items, bucket), waitingOn: bucket === 'waiting' ? it.waitingOn : '' });
 }
 
 async function delItem(id) {
@@ -336,8 +284,7 @@ function addCat(name) {
     toast('That category already exists');
     return null;
   }
-  const used = state.cats.map((c) => c.color);
-  const color = CAT_PALETTE.find((c) => !used.includes(c)) || CAT_PALETTE[state.cats.length % CAT_PALETTE.length];
+  const color = nextColor(state.cats.map((c) => c.color));
   const id = uid('c');
   setDoc(catRef(id), { name, color, createdAt: new Date().toISOString() }).catch(reportWrite);
   return id;
@@ -392,9 +339,6 @@ function reorder(sourceId, targetId, after) {
   });
   batch.commit().catch(reportWrite);
 }
-
-const boardOrder = (a, b) =>
-  a.order !== b.order ? a.order - b.order : (b.createdAt || '').localeCompare(a.createdAt || '');
 
 /* ---------- render ---------- */
 
@@ -465,12 +409,6 @@ function itemHtml(it, num) {
     </div>`;
 }
 
-function matchesFilter(i) {
-  if (!state.catFilter) return true;
-  if (state.catFilter === '__uncat__') return !i.catId;
-  return i.catId === state.catFilter;
-}
-
 function renderCatBar() {
   const active = state.items.filter((i) => !i.done);
   const chips = state.cats.map((c) => {
@@ -517,12 +455,12 @@ function render() {
 
   renderCatBar();
 
-  const active = state.items.filter((i) => !i.done && matchesFilter(i));
-  const done = state.items.filter((i) => i.done && matchesFilter(i));
+  const active = state.items.filter((i) => !i.done && matchesFilter(i, state.catFilter));
+  const done = state.items.filter((i) => i.done && matchesFilter(i, state.catFilter));
 
   const bx = $('buckets');
   bx.innerHTML = BUCKETS.map((b) => {
-    const list = active.filter((i) => i.bucket === b.key).sort(boardOrder);
+    const list = visibleItems(state.items, b.key, state.catFilter);
     const body = list.length
       ? list.map((it, idx) => itemHtml(it, idx + 1)).join('')
       : `<div class="bucket-empty">${b.empty}</div>`;

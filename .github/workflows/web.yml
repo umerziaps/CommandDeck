@@ -1,0 +1,163 @@
+# Web pipeline: test, then deploy to BOTH hosts.
+#
+# This is the only one of the three that does real CD — the web app has no
+# gatekeeper between "tests passed" and "it's live".
+#
+# Read this one first: it's the smallest and it shows the whole shape of a
+# pipeline — triggers, jobs, dependencies between jobs, and secrets.
+
+name: Web
+
+on:
+  # Only run when something that affects the web app changed. Without these
+  # filters, an iOS-only commit would still burn a run.
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'package.json'
+      - 'firebase.json'
+      - '.github/workflows/web.yml'
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'package.json'
+      - '.github/workflows/web.yml'
+  # Adds a "Run workflow" button in the Actions tab.
+  workflow_dispatch:
+
+# Least-privilege by default; individual jobs widen this where they must.
+permissions:
+  contents: read
+
+# A newer push cancels an in-flight run of this workflow on the same branch.
+# Stops two deploys racing each other to the same host.
+concurrency:
+  group: web-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ---------------------------------------------------------------------
+  # 1. TEST — the CI half. Runs on every push and every pull request.
+  # ---------------------------------------------------------------------
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # No `npm ci` — the web app has zero dependencies, so there is nothing
+      # to install. `npm test` runs Node's built-in test runner.
+      - name: Run tests
+        run: npm test
+
+  # ---------------------------------------------------------------------
+  # 2a. DEPLOY TO GITHUB PAGES
+  #
+  # `needs: test` is the whole point of CI/CD: this job does not start
+  # unless the tests passed.
+  #
+  # NOTE: this requires Settings → Pages → Source = "GitHub Actions".
+  # If Pages is still set to "Deploy from a branch", it will keep deploying
+  # on every push regardless of tests and this job will fail.
+  # ---------------------------------------------------------------------
+  deploy-pages:
+    name: Deploy to GitHub Pages
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pages: write            # to publish
+      id-token: write         # to prove to Pages this run is genuine
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+
+      - name: Package the docs folder
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  # ---------------------------------------------------------------------
+  # 2b. DEPLOY TO FIREBASE HOSTING
+  #
+  # Runs in parallel with the Pages job — both depend on `test`, neither
+  # depends on the other.
+  #
+  # Needs a secret: FIREBASE_SERVICE_ACCOUNT (see CI-CD.md).
+  # Without it the job is skipped rather than failing, so the pipeline
+  # stays green before you've set it up.
+  # ---------------------------------------------------------------------
+  deploy-firebase:
+    name: Deploy to Firebase Hosting
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    env:
+      SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to the live channel
+        if: env.SERVICE_ACCOUNT != ''
+        uses: FirebaseExtended/action-hosting-deploy@v0
+        with:
+          repoToken: ${{ secrets.GITHUB_TOKEN }}
+          firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          channelId: live
+          projectId: ${{ secrets.FIREBASE_PROJECT_ID }}
+
+      - name: Explain the skip
+        if: env.SERVICE_ACCOUNT == ''
+        run: |
+          echo "::notice::Skipped — add the FIREBASE_SERVICE_ACCOUNT secret to enable Firebase Hosting deploys. See CI-CD.md."
+
+  # ---------------------------------------------------------------------
+  # 3. PREVIEW DEPLOY FOR PULL REQUESTS
+  #
+  # Firebase preview channels give every PR its own throwaway URL that
+  # expires in 7 days. GitHub Pages has no equivalent — this is the one
+  # place the two hosts genuinely differ in capability.
+  # ---------------------------------------------------------------------
+  preview:
+    name: Preview channel
+    needs: test
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pull-requests: write     # so the action can comment the preview URL
+
+    env:
+      SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy a preview
+        if: env.SERVICE_ACCOUNT != ''
+        uses: FirebaseExtended/action-hosting-deploy@v0
+        with:
+          repoToken: ${{ secrets.GITHUB_TOKEN }}
+          firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          expires: 7d
+          projectId: ${{ secrets.FIREBASE_PROJECT_ID }}

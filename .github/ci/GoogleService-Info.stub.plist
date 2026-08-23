@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A structurally-valid but entirely fake Firebase config.
+
+  CI copies this in when the GOOGLE_SERVICE_INFO_PLIST secret isn't set.
+  The app only needs the file to exist to get past FirebaseApp.configure();
+  the unit tests cover pure model logic and never open a connection, so
+  fake values are enough to build and test.
+
+  Never ship this in a real build — the app would launch and fail to sign in.
+-->
+<plist version="1.0">
+<dict>
+	<key>API_KEY</key><string>AIzaSyStubStubStubStubStubStubStubStub</string>
+	<key>GCM_SENDER_ID</key><string>000000000000</string>
+	<key>BUNDLE_ID</key><string>com.umerzia.CommandDeck</string>
+	<key>PROJECT_ID</key><string>stub-project</string>
+	<key>STORAGE_BUCKET</key><string>stub-project.appspot.com</string>
+	<key>GOOGLE_APP_ID</key><string>1:000000000000:ios:0000000000000000</string>
+	<key>CLIENT_ID</key><string>000000000000-stub.apps.googleusercontent.com</string>
+	<key>REVERSED_CLIENT_ID</key><string>com.googleusercontent.apps.000000000000-stub</string>
+	<key>IS_ADS_ENABLED</key><false/>
+	<key>IS_ANALYTICS_ENABLED</key><false/>
+	<key>IS_APPINVITE_ENABLED</key><true/>
+	<key>IS_GCM_ENABLED</key><true/>
+	<key>IS_SIGNIN_ENABLED</key><true/>
+	<key>PLIST_VERSION</key><string>1</string>
+</dict>
+</plist>

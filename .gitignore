@@ -17,3 +17,13 @@ xcuserdata/
 .firebase/
 firebase-debug.log
 firestore-debug.log
+
+# Xcode test output
+*.xcresult
+
+# Node
+node_modules/
+
+# Firebase config files: injected by CI from secrets (with a stub fallback),
+# kept locally by you. See CI-CD.md.
+CommandDeck/GoogleService-Info.plist

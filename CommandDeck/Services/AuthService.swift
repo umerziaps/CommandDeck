@@ -38,9 +38,10 @@ final class AuthService {
         }
     }
 
-    deinit {
-        if let handle { Auth.auth().removeStateDidChangeListener(handle) }
-    }
+    // No deinit removing the listener: `deinit` is nonisolated even inside
+    // a @MainActor class, so it cannot touch `handle`. It also isn't
+    // needed — AuthService is created once by the App and lives for the
+    // whole process, so the listener is never orphaned.
 
     var displayName: String? { user?.displayName }
     var email: String? { user?.email }

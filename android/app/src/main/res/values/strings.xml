@@ -1,0 +1,14 @@
+<resources>
+    <string name="app_name">Command Deck</string>
+
+    <!--
+      The Google *web* client ID from your Firebase project — NOT the Android
+      one. Credential Manager asks Google for an ID token, and that token has
+      to be minted for the web client so Firebase Auth will accept it.
+
+      Find it at: Firebase console -> Project settings -> General ->
+      Your apps -> Web app -> "Web client ID", or in google-services.json
+      under client[0].oauth_client[] with client_type 3.
+    -->
+    <string name="default_web_client_id" translatable="false">979283514850-uaern0o6hhkolt95dhnv6q3456dmug48.apps.googleusercontent.com</string>
+</resources>

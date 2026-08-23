@@ -1,0 +1,169 @@
+# Android pipeline: test, lint, build an APK, and hand it out.
+#
+# This one gets the full CI *and* CD treatment, because Android has no
+# equivalent of Apple's paid-membership wall — a debug-signed APK installs
+# on any phone with "install unknown apps" enabled, and Firebase App
+# Distribution will hand it out for free.
+
+name: Android
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+  pull_request:
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+# Every step runs from android/ rather than the repo root.
+defaults:
+  run:
+    working-directory: android
+
+jobs:
+
+  build:
+    name: Test, lint and assemble
+    runs-on: ubuntu-latest
+
+    env:
+      GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+      DEBUG_KEYSTORE_BASE64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # Caches the Gradle distribution and dependency downloads between
+      # runs. Without it every run re-downloads ~500MB of Android SDK jars
+      # and takes several minutes longer.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # The google-services plugin refuses to configure without this file.
+      # Real value comes from a secret; otherwise fall back to the committed
+      # placeholder so the build still compiles. CI only builds and runs
+      # JVM tests — neither talks to Firebase — so the placeholder is enough.
+      - name: Provide google-services.json
+        run: |
+          if [ -n "$GOOGLE_SERVICES_JSON" ]; then
+            echo "$GOOGLE_SERVICES_JSON" > app/google-services.json
+            echo "::notice::Using the real google-services.json from secrets."
+          else
+            cp app/google-services.placeholder.json app/google-services.json
+            echo "::notice::No GOOGLE_SERVICES_JSON secret — using the placeholder. Fine for building and unit tests."
+          fi
+      # Runners are disposable VMs: left alone, Gradle generates a fresh
+      # debug keystore on every run, so every build would have a different
+      # signing fingerprint and Google sign-in would fail in the APK.
+      - name: Provide the shared debug keystore
+        run: |
+          if [ -n "$DEBUG_KEYSTORE_BASE64" ]; then
+            echo "$DEBUG_KEYSTORE_BASE64" | base64 --decode > debug.keystore
+            echo "::notice::Using the shared debug keystore — sign-in works in this APK."
+          else
+            echo "::warning::No DEBUG_KEYSTORE_BASE64 secret. This APK builds and installs, but Google sign-in inside it will fail because the runner signed it with a throwaway key."
+          fi
+
+      - name: Show signing fingerprints
+        run: ./gradlew signingReport --quiet || true
+        
+      - name: Unit tests
+        run: ./gradlew test --stacktrace
+
+      # `if: always()` so the report is uploaded even when tests FAIL —
+      # which is exactly when you want to read it.
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-test-report
+          path: android/app/build/reports/tests/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Android Lint
+        run: ./gradlew lintDebug --stacktrace
+
+      - name: Upload lint report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-lint-report
+          path: android/app/build/reports/lint-results-debug.html
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Assemble debug APK
+        run: ./gradlew assembleDebug --stacktrace
+
+      # Downloadable from the run's summary page for 14 days. This alone is
+      # most of the value: any commit, anyone, an installable build.
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: command-deck-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+          retention-days: 14
+
+  # ---------------------------------------------------------------------
+  # DISTRIBUTE — the CD half.
+  #
+  # Pushes the APK to Firebase App Distribution, which emails your testers
+  # a link. Free, and no Play Console account needed.
+  #
+  # Skipped (not failed) until you add the secrets. See CI-CD.md.
+  # ---------------------------------------------------------------------
+  distribute:
+    name: Firebase App Distribution
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    env:
+      APP_ID: ${{ secrets.FIREBASE_ANDROID_APP_ID }}
+      SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the APK from the build job
+        if: env.APP_ID != '' && env.SERVICE_ACCOUNT != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: command-deck-debug-apk
+          path: apk
+
+      - name: Distribute
+        if: env.APP_ID != '' && env.SERVICE_ACCOUNT != ''
+        uses: wzieba/Firebase-Distribution-Github-Action@v1
+        with:
+          appId: ${{ secrets.FIREBASE_ANDROID_APP_ID }}
+          serviceCredentialsFileContent: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          groups: testers
+          file: apk/app-debug.apk
+          releaseNotes: |
+            ${{ github.event.head_commit.message }}
+
+            Commit ${{ github.sha }}
+
+      - name: Explain the skip
+        if: env.APP_ID == '' || env.SERVICE_ACCOUNT == ''
+        run: |
+          echo "::notice::Skipped — add FIREBASE_ANDROID_APP_ID and FIREBASE_SERVICE_ACCOUNT to distribute builds. See CI-CD.md."

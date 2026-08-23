@@ -1,19 +1,24 @@
 # Command Deck
 
 A personal task board — Now / Waiting / Later, categories, sub-tasks,
-urgent flags, due dates — running as a **native iOS app** and a **web app**
-over one shared Firestore backend.
+urgent flags, due dates — running as a **native iOS app**, a **native
+Android app**, and a **web app** over one shared Firestore backend, with
+**CI/CD for all three**.
 
 ```
 CommandDeck/
   CommandDeck.xcodeproj      the iOS app (Xcode 16+, iOS 17+)
   CommandDeck/               its Swift sources
+  CommandDeckTests/          its unit tests
+  android/                   the Android app (Kotlin + Compose, minSdk 26)
   docs/                      the web SPA — what both hosts serve
+  .github/workflows/         the three CI/CD pipelines
   firebase.json              Firebase Hosting + rules deployment config
   firestore.rules            security rules; publish these before using it
   firestore.indexes.json     empty on purpose — no composite indexes needed
   Info.plist                 needs your REVERSED_CLIENT_ID pasted in
   FIREBASE-SETUP.md          ← start here
+  CI-CD.md                   the pipelines, the secrets, and what the tests cover
 ```
 
 **→ [FIREBASE-SETUP.md](FIREBASE-SETUP.md) is the setup guide.** Nothing
@@ -22,12 +27,17 @@ rather than failing silently.
 
 ---
 
-## The two clients
+## The three clients
 
 **iOS** — SwiftUI, iOS 17+. Firestore snapshot listeners drive the board;
 the SDK's local cache means it opens and accepts edits with no signal, and
 queued writes flush on reconnect. Local notifications fire on the morning
 an item is due (no push entitlement, so a free Apple account is fine).
+
+**Android** — Kotlin and Jetpack Compose, minSdk 26. Firestore snapshot
+listeners into `StateFlow`; Google sign-in through Credential Manager. The
+model layer is deliberately free of Android and Firebase types so its unit
+tests run on a plain JVM — no emulator in CI.
 
 **Web** — plain HTML/CSS/ES modules with the Firebase SDK from the CDN.
 No npm, no bundler, no build step, no Actions workflow. Because it's static,
@@ -36,8 +46,26 @@ up for both, and they can serve the same `docs/` folder at the same time
 (the setup guide compares the two deploy models). It's a PWA, so iOS Safari
 can "Add to Home Screen" and get the icon and a standalone window.
 
-Both sign in with Google and land on `users/{uid}/…`, which is what makes
-them the same board rather than two.
+All three sign in with Google and land on `users/{uid}/…`, which is what
+makes them the same board rather than three.
+
+---
+
+## Tests and CI/CD
+
+Every push runs the tests; a green web build deploys itself to both hosts.
+**[CI-CD.md](CI-CD.md)** covers the pipelines, the secrets, and what the
+tests actually protect against.
+
+```bash
+npm test                        # web    — 29 tests, instant
+cd android && ./gradlew test    # android — JVM only, no emulator
+# iOS: ⌘U in Xcode
+```
+
+The suites focus on the wire format — three clients writing the same
+Firestore documents, where a renamed field reads back as a silent default
+rather than an error.
 
 ---
 

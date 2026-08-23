@@ -1,0 +1,123 @@
+# iOS pipeline: build and test on a real macOS runner.
+#
+# CI only — no CD. Delivery (TestFlight, or Firebase App Distribution for
+# iOS) needs an App Store Connect account, which needs the paid Apple
+# Developer Program. Your free personal team can build and test all day but
+# cannot sign a build for distribution.
+#
+# That's still most of the value. This catches "does it compile, do the
+# tests pass" on every push — the actor-isolation error that bit you on
+# CommandDeckApp would have shown up here first.
+#
+# COST NOTE: macOS runners are free on PUBLIC repositories. On a private
+# repo they bill against your monthly allowance at 10x the Linux rate, so
+# an iOS build eats it fast. Keep this repo public.
+
+name: iOS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'CommandDeck/**'
+      - 'CommandDeckTests/**'
+      - 'CommandDeck.xcodeproj/**'
+      - 'Info.plist'
+      - '.github/workflows/ios.yml'
+  pull_request:
+    paths:
+      - 'CommandDeck/**'
+      - 'CommandDeckTests/**'
+      - 'CommandDeck.xcodeproj/**'
+      - '.github/workflows/ios.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  build-and-test:
+    name: Build and test
+    runs-on: macos-latest
+
+    env:
+      SCHEME: CommandDeck
+      GOOGLE_SERVICE_INFO_PLIST: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show the toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      # The app checks for this file at launch and shows a setup screen if
+      # it's missing — but the build itself doesn't need real values, so a
+      # stub is enough to compile and run the unit tests. Those cover pure
+      # model logic and never open a connection.
+      - name: Provide GoogleService-Info.plist
+        run: |
+          if [ -n "$GOOGLE_SERVICE_INFO_PLIST" ]; then
+            echo "$GOOGLE_SERVICE_INFO_PLIST" | base64 --decode > CommandDeck/GoogleService-Info.plist
+            echo "::notice::Using the real GoogleService-Info.plist from secrets."
+          else
+            cp .github/ci/GoogleService-Info.stub.plist CommandDeck/GoogleService-Info.plist
+            echo "::notice::No GOOGLE_SERVICE_INFO_PLIST secret — using the stub. Fine for building and unit tests."
+          fi
+
+      # Swift Package Manager dependencies are declared in the .xcodeproj.
+      # Resolving them as a separate step means a dependency failure reads
+      # as "couldn't resolve packages" rather than a wall of compiler errors.
+      - name: Resolve Swift packages
+        run: xcodebuild -resolvePackageDependencies -scheme "$SCHEME"
+
+      # Runner images change their bundled simulators without warning, so
+      # hard-coding "iPhone 16" is how iOS pipelines rot. Ask the runner
+      # what it actually has instead.
+      - name: Pick a simulator
+        run: |
+          UDID=$(xcrun simctl list devices available --json | python3 -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"]
+          best = None
+          for runtime, devs in devices.items():
+              if "iOS" not in runtime:
+                  continue
+              for dev in devs:
+                  if dev.get("isAvailable") and "iPhone" in dev["name"]:
+                      best = (dev["udid"], dev["name"], runtime)
+          if not best:
+              sys.exit("No iPhone simulator available on this runner")
+          print(best[0])
+          print(f"picked {best[1]} ({best[2]})", file=sys.stderr)
+          ')
+          echo "DESTINATION=platform=iOS Simulator,id=$UDID" >> "$GITHUB_ENV"
+
+      # CODE_SIGNING_ALLOWED=NO: simulator builds don't need signing, and
+      # the runner has none of your certificates anyway. This is what lets
+      # iOS CI work with no Apple Developer membership at all.
+      - name: Build and test
+        run: |
+          xcodebuild test \
+            -scheme "$SCHEME" \
+            -destination "$DESTINATION" \
+            -resultBundlePath TestResults.xcresult \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
+      # The .xcresult bundle holds every test's result and any failure
+      # diff. Uploaded on failure too — that's when you need it.
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-test-results
+          path: TestResults.xcresult
+          retention-days: 14
+          if-no-files-found: ignore

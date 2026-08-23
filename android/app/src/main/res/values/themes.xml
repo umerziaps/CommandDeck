@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Compose draws the whole UI, so the Android theme only needs to cover
+      the window before the first frame. Material3's NoActionBar keeps the
+      system from drawing a title bar we'd have to hide.
+    -->
+    <style name="Theme.CommandDeck" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:windowBackground">@color/ic_launcher_background</item>
+    </style>
+</resources>

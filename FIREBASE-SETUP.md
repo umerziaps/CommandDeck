@@ -1,7 +1,9 @@
-# Setting up Firebase, the web app, and the iPhone app
+# Setting up Firebase and the three clients
 
-Roughly 25 minutes end to end (add ten if you set up both hosts). No credit card — everything here runs on
-Firebase's free **Spark** plan.
+About 30 minutes end to end, plus ten if you set up both web hosts. No
+credit card — everything here runs on Firebase's free **Spark** plan.
+
+For the pipelines that build and deploy all this, see [CI-CD.md](CI-CD.md).
 
 > **Why Firestore and not Firebase Storage?** Storage is a blob store for
 > files, and since September 2024 it requires the paid Blaze plan with no
@@ -243,6 +245,156 @@ and it appears in the browser within a second or so, and the reverse.
 
 ---
 
+## 8. The Android app
+
+### Register it
+
+**Project settings → General → Your apps → Add app → Android**.
+
+- **Package name:** `com.umerzia.commanddeck` (must match exactly).
+- Download **`google-services.json`** into `android/app/`.
+
+That file is gitignored — CI injects it from a secret, and you keep your own
+copy locally. See [CI-CD.md](CI-CD.md).
+
+### Signing fingerprints — sign-in fails silently without this
+
+Google checks the **signing certificate** of the app asking for a token, so
+Firebase has to know your app's SHA-1 fingerprint. Miss this and the sign-in
+sheet opens, you pick your account, and nothing happens. No error, no crash.
+
+There's a wrinkle that catches people out: **debug keystores are
+per-machine.** Your Mac auto-generated `~/.android/debug.keystore` the first
+time you built. A GitHub Actions runner is a throwaway VM, so it generates
+its own — a different key, with a different fingerprint, **on every run**.
+
+Register only your Mac's fingerprint and you get: local builds sign in fine,
+CI-built APKs install but can't sign in. Chasing that is miserable, because
+the failure looks identical to every other cause.
+
+So use **one shared debug keystore** for every machine.
+
+**1. Generate it once**, from the `android/` folder:
+
+```bash
+cd android
+keytool -genkeypair -v \
+  -keystore debug.keystore \
+  -storepass android -keypass android \
+  -alias androiddebugkey \
+  -keyalg RSA -keysize 2048 -validity 10000 \
+  -dname "CN=Android Debug,O=Android,C=US"
+```
+
+`app/build.gradle.kts` picks this file up automatically when it's present.
+It's gitignored — it's a signing key, not config.
+
+> No `keytool` on your PATH? It ships with the JDK Android Studio bundles.
+> Either add that JDK's `bin` to your PATH, or just let Gradle do it:
+> build once without the file and use the fingerprint from step 2.
+
+**2. Read its fingerprint:**
+
+```bash
+./gradlew signingReport
+```
+
+Look for the `debug` variant's `SHA1:` line. (`keytool -list -v -keystore
+debug.keystore -storepass android | grep SHA1` gives the same answer.)
+
+**3. Register it:** Firebase console → **Project settings → Your apps →
+Android → Add fingerprint**. Paste the SHA-1.
+
+**4. Re-download `google-services.json`** into `android/app/`. It changes
+once a fingerprint is registered — this step is easy to skip and breaks
+everything.
+
+**5. For CI**, hand the same keystore to the runner:
+
+```bash
+base64 -i android/debug.keystore | pbcopy
+```
+
+Paste that as a repository secret named **`DEBUG_KEYSTORE_BASE64`**
+(Settings → Secrets and variables → Actions). The workflow decodes it back
+before building, so CI-built APKs carry the fingerprint Firebase already
+knows.
+
+Without that secret the Android pipeline still runs — it just prints a
+warning and produces an APK that installs but can't sign in.
+
+**Is committing/sharing a debug keystore risky?** Mildly. Anyone holding it
+could build an app that presents your app's fingerprint to Google. They'd
+still land on their own UID, and your Firestore rules confine every account
+to `users/{their-uid}/…`, so they can't reach your board. It's a real key
+though, which is why it goes in a secret rather than in the repo. A *release*
+keystore would be a different conversation entirely — losing or leaking one
+of those is unrecoverable.
+
+### Paste the web client ID
+
+Open `android/app/src/main/res/values/strings.xml` and replace
+`PASTE_WEB_CLIENT_ID` in `default_web_client_id`.
+
+It must be the **web** client ID, not the Android one. Credential Manager
+asks Google for an ID token, and Firebase Auth only accepts tokens minted
+for the web client. Find it in `google-services.json` under
+`client[0].oauth_client[]` with `client_type: 3`, or in the console under
+Your apps → Web app → Web client ID.
+
+Using the Android client ID here is the second most common way to get a
+sign-in flow that opens and then does nothing.
+
+### Turn on App Distribution — needed for the Android pipeline
+
+Skip this if you aren't setting up CI yet. It's what lets a push to `main`
+put a new build on your phone without plugging anything in.
+
+1. **Release & Monitor → App Distribution → Get started.** Pick the Android
+   app you just registered.
+2. **Testers & Groups** tab → **Add group**. Name it exactly **`testers`** —
+   that string is hard-coded in `.github/workflows/android.yml` under
+   `groups:`. Rename one and change the other.
+3. Add your own email address to that group.
+4. Back on **Project settings → General → Your apps → Android**, copy the
+   **App ID**. It looks like `1:123456789012:android:abc123def456`. That's
+   the `FIREBASE_ANDROID_APP_ID` secret in
+   [CI-CD.md](CI-CD.md).
+
+The service account you create for CI also needs the **Firebase App
+Distribution Admin** role, not just Hosting Admin — CI-CD.md covers making
+that account.
+
+**On the first distributed build** you'll get an invitation email. Accept it
+on the phone, install Google's **Firebase App Tester** app when prompted,
+and after that every CI build shows up there automatically.
+
+No Play Console account, no $25 registration fee, no review. The APK is
+debug-signed, so the phone will ask you to allow installs from App Tester
+the first time.
+
+### Build and run
+
+```bash
+cd android
+./gradlew test          # JVM unit tests — fast, no emulator
+./gradlew assembleDebug # produces app/build/outputs/apk/debug/app-debug.apk
+```
+
+Or just open the `android/` folder in Android Studio and hit Run.
+
+### What the Android client does and doesn't do
+
+It covers the board: buckets, capture, complete, urgent, move, categories
+with colours, sub-tasks, due dates, filtering — all against the same
+Firestore documents as the other two.
+
+Not included: drag-to-reorder (Compose has no built-in reorderable list, and
+it's a chunk of gesture code) and backup import/export. Notes & Logins is
+absent by design — it stays on the iPhone, behind Face ID.
+
+---
+
 ## What's stored where
 
 ```
@@ -322,3 +474,21 @@ therefore different boards, working exactly as designed.
 
 **Nothing syncs and the phone shows the offline icon** — Firestore is
 serving from cache. Writes are queued, not lost; they flush on reconnect.
+
+**Android: the sign-in sheet opens, you pick an account, nothing happens** —
+one of three things, all of which fail silently by design (see step 8):
+the signing fingerprint isn't registered in Firebase; `default_web_client_id`
+holds the Android client ID instead of the web one; or you're running a
+**CI-built APK** without the `DEBUG_KEYSTORE_BASE64` secret, so the runner
+signed it with a throwaway key Firebase has never seen.
+
+To tell which: `cd android && ./gradlew signingReport` and check that SHA-1
+is listed in Firebase. For a CI build, the Android workflow prints its own
+fingerprints in the "Show signing fingerprints" step.
+
+**Android: "Default FirebaseApp is not initialized"** — `google-services.json`
+isn't in `android/app/`, or it's the placeholder.
+
+**Android build fails with "Could not find com.android.tools.build:gradle"** —
+the pinned version in `gradle/libs.versions.toml` doesn't exist any more.
+Bump it. CI catching that instead of your laptop is the system working.

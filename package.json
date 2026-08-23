@@ -1,0 +1,12 @@
+{
+  "name": "command-deck",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Command Deck — web client and its tests. No dependencies by design.",
+  "//": "type:module tells Node these .js files are ES modules, the same way the browser already treats them via <script type=module>.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test docs/*.test.js",
+    "serve": "python3 -m http.server 8000 --directory docs"
+  }
+}

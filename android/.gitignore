@@ -1,0 +1,21 @@
+# Gradle / Android build output
+.gradle/
+build/
+app/build/
+local.properties
+.cxx/
+*.apk
+*.aab
+
+# Your real Firebase config. CI writes it from a secret; locally you download
+# it from the Firebase console. See FIREBASE-SETUP.md.
+app/google-services.json
+
+# IDE
+.idea/
+*.iml
+captures/
+
+# Shared debug keystore. It IS a signing key — generate it once, register its
+# SHA-1 in Firebase, and store it as the DEBUG_KEYSTORE_BASE64 secret.
+debug.keystore

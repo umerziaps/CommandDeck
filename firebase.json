@@ -4,21 +4,28 @@
     "ignore": [
       "firebase.json",
       "**/.*",
-      "**/node_modules/**"
+      "**/node_modules/**",
+      "**/*.test.js"
     ],
     "headers": [
       {
         "//": "App code is unhashed, so it must revalidate or you'll ship a stale board after a deploy.",
         "source": "**/*.@(html|js|css|webmanifest)",
         "headers": [
-          { "key": "Cache-Control", "value": "no-cache" }
+          {
+            "key": "Cache-Control",
+            "value": "no-cache"
+          }
         ]
       },
       {
         "//": "Icons change ~never; let them sit in the browser cache.",
         "source": "**/*.@(png|svg|ico)",
         "headers": [
-          { "key": "Cache-Control", "value": "public, max-age=604800" }
+          {
+            "key": "Cache-Control",
+            "value": "public, max-age=604800"
+          }
         ]
       }
     ]
