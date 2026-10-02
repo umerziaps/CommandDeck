@@ -183,6 +183,7 @@
         </button>
       </div>
       <div class="vault-notice" id="v-autolock-note"></div>
+      <div class="group-bar" id="v-group-bar"></div>
       <div id="v-list" class="v-list"></div>
     </section>
   </div><!-- /vault-view -->
@@ -264,6 +265,17 @@
       <label class="vault-label" for="e-url">Website</label>
       <input type="text" id="e-url" placeholder="chase.com" autocomplete="off" spellcheck="false" inputmode="url">
 
+      <label class="vault-label" for="e-group">Group</label>
+      <div class="group-pick-row">
+        <select id="e-group"></select>
+        <button class="btn-quiet compact" id="e-group-new" type="button">New group</button>
+      </div>
+      <div class="group-new-row hidden" id="e-group-new-row">
+        <input type="text" id="e-group-name" placeholder="Ocufii staging VMs" autocomplete="off" maxlength="60">
+        <button class="btn-primary compact" id="e-group-save" type="button">Create</button>
+        <button class="btn-quiet compact" id="e-group-cancel" type="button">Cancel</button>
+      </div>
+
       <label class="vault-label" for="e-notes">Notes</label>
       <textarea id="e-notes" rows="3" spellcheck="false"></textarea>
 
@@ -275,6 +287,27 @@
         <button class="btn-primary" id="e-save">Save</button>
       </div>
     </div>
+  </div>
+</div>
+
+<!-- ============ manage vault groups ============ -->
+<div class="ov" id="group-ov">
+  <div class="sheet">
+    <div class="sheet-head">
+      <h3>Vault groups</h3>
+      <button class="sheet-x" id="group-x" aria-label="Close">✕</button>
+    </div>
+    <div class="cat-add-row">
+      <input type="text" id="g-new" placeholder="New group" autocomplete="off" maxlength="60">
+      <button id="g-new-btn">Add</button>
+    </div>
+    <p class="vault-error" id="g-error"></p>
+    <div id="g-manage-list" class="cat-manage-list"></div>
+    <p class="sheet-foot">
+      Group names are encrypted with everything else — the database cannot see that you
+      keep credentials for “production” any more than it can see the passwords.
+      Deleting a group leaves its entries in place, ungrouped.
+    </p>
   </div>
 </div>
 

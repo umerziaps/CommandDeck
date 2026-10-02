@@ -291,10 +291,13 @@ export async function unlockVault(passphrase, config, { provider } = {}) {
 
 /* ---------- entries ---------- */
 
-export const ENTRY_FIELDS = ['title', 'username', 'password', 'url', 'notes', 'catId'];
+// `groupId` replaced an unused `catId` placeholder. Nothing was ever written
+// into it, so there is no migration: an older entry decrypts, the unknown key
+// is dropped by normaliseEntry, and groupId defaults to '' — ungrouped.
+export const ENTRY_FIELDS = ['title', 'username', 'password', 'url', 'notes', 'groupId'];
 
 export function blankEntry() {
-  return { title: '', username: '', password: '', url: '', notes: '', catId: '' };
+  return { title: '', username: '', password: '', url: '', notes: '', groupId: '' };
 }
 
 // Narrows whatever came back from decryption to exactly the known fields, so
@@ -343,6 +346,117 @@ export function vaultSearch(entries, query) {
   if (!q) return entries;
   return entries.filter((e) =>
     ['title', 'username', 'url', 'notes'].some((f) => (e[f] || '').toLowerCase().includes(q)));
+}
+
+/* ---------- groups ---------- *
+ *
+ * A group is a folder: "Ocufii staging VMs", "AWS", "personal". Entries carry
+ * a groupId; the group's own name and colour live in their own documents.
+ *
+ * Those names are encrypted exactly like entries are. It would have been far
+ * less code to reuse the board's plaintext categories, and the result would
+ * have been a database that cannot show you a password but will happily tell
+ * anyone who reads it that you keep credentials for "Ocufii production
+ * database". The group name is often the most sensitive string in the record:
+ * it says what the credential is FOR. Encrypting the secret and publishing the
+ * label would be security theatre.
+ *
+ * Deleting a group never deletes its entries. They fall back to ungrouped,
+ * because losing a credential to a mis-click on a folder is not a trade
+ * anyone would accept.
+ */
+
+export const GROUP_FIELDS = ['name', 'color'];
+
+// Distinguishable in both themes and at the 10px dot used in the filter bar.
+export const GROUP_PALETTE = [
+  '#5EE6C5', '#7C89F0', '#F0B45E', '#FF6B54',
+  '#58C4F0', '#C98BF0', '#8FD35A', '#F07EA8'
+];
+
+export const UNGROUPED = '__ungrouped__';
+
+export function blankGroup(existingCount = 0) {
+  return { name: '', color: GROUP_PALETTE[existingCount % GROUP_PALETTE.length] };
+}
+
+export function normaliseGroup(id, body, meta = {}) {
+  const name = typeof body?.name === 'string' ? body.name : '';
+  let color = typeof body?.color === 'string' ? body.color : '';
+  if (!/^#[0-9A-Fa-f]{6}$/.test(color)) color = GROUP_PALETTE[0];
+  return {
+    id,
+    name,
+    color,
+    createdAt: typeof meta.createdAt === 'string' ? meta.createdAt : ''
+  };
+}
+
+export function groupBody(group) {
+  const out = {};
+  for (const f of GROUP_FIELDS) out[f] = typeof group?.[f] === 'string' ? group[f] : '';
+  return out;
+}
+
+export function validateGroup(group, existing = [], selfId = null) {
+  const name = (group?.name || '').trim();
+  if (!name) return { ok: false, error: 'Give the group a name.' };
+  if (name.length > 60) return { ok: false, error: 'That name is too long (60 characters max).' };
+  const clash = existing.some((g) =>
+    g.id !== selfId && (g.name || '').trim().toLowerCase() === name.toLowerCase());
+  if (clash) return { ok: false, error: 'You already have a group with that name.' };
+  return { ok: true };
+}
+
+// Oldest first, so the order groups were created in is the order they appear.
+// Alphabetical would reshuffle the whole list the moment one is renamed.
+export const groupOrder = (a, b) =>
+  (a.createdAt || '').localeCompare(b.createdAt || '')
+  || (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' });
+
+export const groupById = (groups, id) => groups.find((g) => g.id === id) || null;
+
+// An entry whose groupId points at a group that no longer exists reads as
+// ungrouped rather than vanishing. Deleting a group rewrites its entries, but
+// a failed write, a half-synced device or a stale cache can leave a dangling
+// id, and silently hiding credentials would be the worst possible response.
+export function entryGroupId(entry, groups) {
+  const id = entry?.groupId || '';
+  return id && groups.some((g) => g.id === id) ? id : '';
+}
+
+export function countByGroup(entries, groups) {
+  const counts = { [UNGROUPED]: 0 };
+  for (const g of groups) counts[g.id] = 0;
+  for (const e of entries) {
+    const id = entryGroupId(e, groups) || UNGROUPED;
+    counts[id] = (counts[id] || 0) + 1;
+  }
+  return counts;
+}
+
+export function filterByGroup(entries, groups, groupFilter) {
+  if (!groupFilter) return entries;
+  if (groupFilter === UNGROUPED) return entries.filter((e) => !entryGroupId(e, groups));
+  return entries.filter((e) => entryGroupId(e, groups) === groupFilter);
+}
+
+// Buckets entries into sections in group order, with ungrouped last. Empty
+// groups are kept so a group you just made does not look like it failed.
+export function sectionsByGroup(entries, groups) {
+  const ordered = [...groups].sort(groupOrder);
+  const sections = ordered.map((g) => ({ group: g, entries: [] }));
+  const index = new Map(sections.map((s) => [s.group.id, s]));
+  const loose = { group: null, entries: [] };
+
+  for (const e of entries) {
+    const id = entryGroupId(e, groups);
+    (index.get(id) || loose).entries.push(e);
+  }
+  for (const s of sections) s.entries.sort(entryOrder);
+  loose.entries.sort(entryOrder);
+
+  return loose.entries.length ? [...sections, loose] : sections;
 }
 
 /* ---------- password generator ---------- */

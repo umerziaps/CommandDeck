@@ -30,6 +30,9 @@ import {
   createVaultConfig, unlockVault, encryptJson, decryptJson,
   blankEntry, normaliseEntry, entryBody, entryOrder,
   validateEntry, validatePassphrase, vaultSearch,
+  blankGroup, normaliseGroup, groupBody, groupOrder, groupById, validateGroup,
+  countByGroup, filterByGroup, sectionsByGroup, entryGroupId,
+  GROUP_PALETTE, UNGROUPED,
   genPassword, passwordStrength, maskSecret, hasSmartPunctuation,
   WrongPassphraseError, VAULT_VERSION
 } from './vault.js';
@@ -139,12 +142,15 @@ const vault = {
   config: null,     // the vaultMeta/config document, or null before first run
   key: null,        // CryptoKey while unlocked, null while locked
   entries: [],      // decrypted, in memory only
+  groups: [],       // decrypted, in memory only
   revealed: {},     // entryId -> true while its password is on screen
   query: '',
+  groupFilter: '',  // '' = all, UNGROUPED, or a group id
   configError: null, // set when the config could not be READ, which is not
                      // the same as the vault not existing
   editingId: null,  // null means "new entry"
   unsub: null,
+  unsubGroups: null,
   gen: 0,           // guards against an out-of-order async snapshot render
   idleTimer: null,
   clipTimer: null
@@ -160,6 +166,8 @@ const catRef   = (id) => doc(db, 'users', state.user.uid, 'categories', id);
 const vaultCol = () => collection(db, 'users', state.user.uid, 'vault');
 const vaultRef = (id) => doc(db, 'users', state.user.uid, 'vault', id);
 const vaultCfgRef = () => doc(db, 'users', state.user.uid, 'vaultMeta', 'config');
+const groupsCol = () => collection(db, 'users', state.user.uid, 'vaultGroups');
+const groupRef = (id) => doc(db, 'users', state.user.uid, 'vaultGroups', id);
 const catOf    = (id) => state.cats.find((c) => c.id === id) || null;
 
 /* ---------- auth ---------- */
@@ -934,13 +942,18 @@ async function doUnlock() {
 function lockVault(reason) {
   vault.key = null;
   vault.entries = [];
+  vault.groups = [];
   vault.revealed = {};
   vault.query = '';
+  vault.groupFilter = '';
   vault.editingId = null;
   vault.gen++;                      // orphan any snapshot decryption in flight
   if (vault.unsub) { vault.unsub(); vault.unsub = null; }
+  if (vault.unsubGroups) { vault.unsubGroups(); vault.unsubGroups = null; }
   if (vault.idleTimer) { clearTimeout(vault.idleTimer); vault.idleTimer = null; }
   $('entry-ov').classList.remove('show');
+  $('group-ov').classList.remove('show');
+  $('v-group-bar').innerHTML = '';     // group names are secrets too
   $('v-search').value = '';
   clearPassphraseInputs();
   $('vl-lede').textContent = reason || 'Enter your master passphrase to decrypt.';
@@ -996,6 +1009,24 @@ function subscribeVault() {
     console.error(err);
     toast('Could not read the vault — check the Firestore rules');
   });
+
+  vault.unsubGroups = onSnapshot(groupsCol(), async (snap) => {
+    const key = vault.key;
+    if (!key) return;
+
+    const decrypted = await Promise.all(snap.docs.map(async (d) => {
+      try {
+        const body = await decryptJson(key, d.data().data, { aad: d.id });
+        return normaliseGroup(d.id, body, d.data());
+      } catch (_) {
+        return normaliseGroup(d.id, { name: '⚠︎ Unreadable group' }, d.data());
+      }
+    }));
+
+    if (myGen !== vault.gen || !vault.key) return;
+    vault.groups = decrypted.sort(groupOrder);
+    if (currentView === 'vault') renderVault();
+  }, (err) => console.error(err));
 }
 
 /* ---------- writes ---------- */
@@ -1009,7 +1040,7 @@ async function saveEntry() {
     password: $('e-password').value,
     url: $('e-url').value.trim(),
     notes: $('e-notes').value,
-    catId: ''
+    groupId: $('e-group').value || ''
   };
 
   const check = validateEntry(entry);
@@ -1049,6 +1080,78 @@ async function deleteEntry(id) {
     closeEntry();
     toast('Deleted', true);
   } catch (err) { console.error(err); toast('Delete failed'); }
+}
+
+/* ---------- groups ---------- */
+
+async function addGroup(name, { color } = {}) {
+  if (!vault.key) return null;
+  const group = { ...blankGroup(vault.groups.length), name: (name || '').trim() };
+  if (color) group.color = color;
+
+  const check = validateGroup(group, vault.groups);
+  if (!check.ok) return { error: check.error };
+
+  const id = uid('g');
+  try {
+    const data = await encryptJson(vault.key, groupBody(group), { aad: id });
+    await setDoc(groupRef(id), { v: VAULT_VERSION, data, createdAt: new Date().toISOString() });
+    return { id };
+  } catch (err) {
+    console.error(err);
+    return { error: `Could not create the group: ${err?.message || err}` };
+  }
+}
+
+async function saveGroup(id, fields) {
+  if (!vault.key) return { error: 'The vault is locked.' };
+  const current = groupById(vault.groups, id);
+  if (!current) return { error: 'That group no longer exists.' };
+
+  const next = { ...current, ...fields };
+  const check = validateGroup(next, vault.groups, id);
+  if (!check.ok) return check;
+
+  try {
+    const data = await encryptJson(vault.key, groupBody(next), { aad: id });
+    await updateDoc(groupRef(id), { data, updatedAt: new Date().toISOString() });
+    return { ok: true };
+  } catch (err) {
+    console.error(err);
+    return { error: `Could not save: ${err?.message || err}` };
+  }
+}
+
+async function delGroup(id) {
+  const g = groupById(vault.groups, id);
+  const members = vault.entries.filter((e) => entryGroupId(e, vault.groups) === id);
+
+  const ok = await askConfirm(
+    members.length
+      ? `"${g?.name || 'This group'}" will be deleted. Its ${members.length} credential${members.length === 1 ? '' : 's'} `
+        + 'will stay in the vault, just ungrouped.'
+      : `"${g?.name || 'This group'}" will be deleted.`,
+    'Delete group?'
+  );
+  if (!ok) return;
+
+  try {
+    // Clear the members FIRST. If this is interrupted, the worst outcome is a
+    // group that still exists with its entries intact — recoverable. Deleting
+    // the group first would leave entries pointing at nothing, which is the
+    // state entryGroupId has to defend against.
+    for (const e of members) {
+      const body = entryBody({ ...e, groupId: '' });
+      const data = await encryptJson(vault.key, body, { aad: e.id });
+      await updateDoc(vaultRef(e.id), { data, updatedAt: new Date().toISOString() });
+    }
+    await deleteDoc(groupRef(id));
+    if (vault.groupFilter === id) vault.groupFilter = '';
+    toast('Group deleted — its credentials were kept', true);
+  } catch (err) {
+    console.error(err);
+    toast('Could not delete the group');
+  }
 }
 
 /* ---------- clipboard ---------- */
@@ -1130,22 +1233,74 @@ function renderVault() {
     return;
   }
 
-  const shown = vaultSearch(vault.entries, vault.query);
+  const matched = vaultSearch(vault.entries, vault.query);
+  const shown = filterByGroup(matched, vault.groups, vault.groupFilter);
 
   $('v-autolock-note').textContent = vault.entries.length
     ? `${vault.entries.length} credential${vault.entries.length === 1 ? '' : 's'} · encrypted in this browser · locks itself after 10 minutes idle`
     : '';
 
+  renderGroupBar(matched);
+
   if (!shown.length) {
     $('v-list').innerHTML = `<div class="v-empty">${
       vault.entries.length
-        ? 'Nothing matches that search.'
+        ? (vault.query || vault.groupFilter ? 'Nothing matches.' : 'Nothing here yet.')
         : 'Nothing here yet.<br>Everything you add is encrypted before it leaves this browser.'
     }</div>`;
+    wireVaultRows();
     return;
   }
 
-  $('v-list').innerHTML = shown.map((e) => {
+  // Sections only when looking at everything. Once a filter or a search has
+  // narrowed things down, headers are noise — the question has been answered.
+  const grouped = !vault.groupFilter && !vault.query && vault.groups.length;
+  $('v-list').innerHTML = grouped
+    ? sectionsByGroup(shown, vault.groups).map((sec) => `
+        <div class="v-section">
+          <div class="v-section-head">
+            <span class="v-dot" style="background:${sec.group ? esc(sec.group.color) : 'var(--ink-3)'}"></span>
+            <span class="v-section-name">${sec.group ? esc(sec.group.name) : 'Ungrouped'}</span>
+            <span class="v-section-count">${sec.entries.length}</span>
+          </div>
+          ${sec.entries.length ? sec.entries.map(rowHtml).join('') : '<div class="v-section-empty">No credentials in this group yet.</div>'}
+        </div>`).join('')
+    : shown.map(rowHtml).join('');
+
+  wireVaultRows();
+}
+
+function renderGroupBar(entriesInScope) {
+  const bar = $('v-group-bar');
+  if (!vault.groups.length) {
+    bar.innerHTML = `<button class="group-chip ghost" data-group-manage>+ Group</button>`;
+  } else {
+    const counts = countByGroup(entriesInScope, vault.groups);
+    const chip = (id, label, color, n) => `
+      <button class="group-chip${vault.groupFilter === id ? ' on' : ''}" data-group="${esc(id)}">
+        ${color ? `<span class="v-dot" style="background:${esc(color)}"></span>` : ''}
+        ${esc(label)}${n === undefined ? '' : `<span class="group-chip-n">${n}</span>`}
+      </button>`;
+
+    bar.innerHTML =
+      chip('', 'All', '', entriesInScope.length)
+      + [...vault.groups].sort(groupOrder).map((g) => chip(g.id, g.name, g.color, counts[g.id] || 0)).join('')
+      + (counts[UNGROUPED] ? chip(UNGROUPED, 'Ungrouped', '', counts[UNGROUPED]) : '')
+      + `<button class="group-chip ghost" data-group-manage>Manage</button>`;
+  }
+
+  bar.querySelectorAll('[data-group]').forEach((b) => b.addEventListener('click', () => {
+    touchVault();
+    vault.groupFilter = b.dataset.group;
+    renderVault();
+  }));
+  bar.querySelector('[data-group-manage]')?.addEventListener('click', () => {
+    touchVault();
+    openGroupManager();
+  });
+}
+
+function rowHtml(e) {
     const revealed = !!vault.revealed[e.id];
     const initial = esc((e.title || '?').trim().charAt(0).toUpperCase() || '?');
     const sub = e.username || e.url || '—';
@@ -1163,8 +1318,9 @@ function renderVault() {
           <button class="v-act" data-act="edit">edit</button>
         </div>
       </div>`;
-  }).join('');
+}
 
+function wireVaultRows() {
   $('v-list').querySelectorAll('.v-row').forEach((row) => {
     const id = row.dataset.id;
     row.querySelectorAll('.v-act').forEach((btn) => btn.addEventListener('click', (ev) => {
@@ -1185,6 +1341,90 @@ function renderVault() {
   });
 }
 
+/* ---------- group picker and manager ---------- */
+
+function fillGroupSelect(selected) {
+  const sel = $('e-group');
+  sel.innerHTML = '<option value="">Ungrouped</option>'
+    + [...vault.groups].sort(groupOrder)
+        .map((g) => `<option value="${esc(g.id)}">${esc(g.name)}</option>`).join('');
+  // A groupId pointing at a deleted group would otherwise silently select
+  // "Ungrouped" and quietly rewrite the entry on the next save.
+  sel.value = selected && vault.groups.some((g) => g.id === selected) ? selected : '';
+}
+
+function showInlineGroup(show) {
+  $('e-group-new-row').classList.toggle('hidden', !show);
+  $('e-group-new').classList.toggle('hidden', show);
+  if (show) { $('e-group-name').value = ''; $('e-group-name').focus(); }
+}
+
+async function createGroupInline() {
+  const name = $('e-group-name').value;
+  const res = await addGroup(name);
+  if (!res) return;
+  if (res.error) { $('e-error').textContent = res.error; return; }
+
+  $('e-error').textContent = '';
+  showInlineGroup(false);
+  // The snapshot that carries the new group is in flight, so seed the select
+  // with it now rather than leaving the field blank for a beat.
+  fillGroupSelect(res.id);
+  const pending = res.id;
+  setTimeout(() => { if ($('entry-ov').classList.contains('show')) fillGroupSelect(pending); }, 400);
+}
+
+function openGroupManager() {
+  $('g-error').textContent = '';
+  $('g-new').value = '';
+  renderGroupManager();
+  $('group-ov').classList.add('show');
+  $('g-new').focus();
+}
+
+function renderGroupManager() {
+  const counts = countByGroup(vault.entries, vault.groups);
+  const list = $('g-manage-list');
+
+  list.innerHTML = vault.groups.length
+    ? [...vault.groups].sort(groupOrder).map((g) => `
+        <div class="cat-manage-row" data-gid="${esc(g.id)}">
+          <input type="text" class="g-name" value="${esc(g.name)}" maxlength="60" aria-label="Group name">
+          <span class="g-count">${counts[g.id] || 0}</span>
+          <button class="g-del" aria-label="Delete group">✕</button>
+          <div class="cat-sw-row">
+            ${GROUP_PALETTE.map((c) => `<button class="cat-sw${c.toLowerCase() === (g.color || '').toLowerCase() ? ' on' : ''}" style="background:${c}" data-color="${c}" aria-label="Colour ${c}"></button>`).join('')}
+          </div>
+        </div>`).join('')
+    : '<div class="v-empty">No groups yet. Add one above.</div>';
+
+  list.querySelectorAll('.cat-manage-row').forEach((row) => {
+    const id = row.dataset.gid;
+
+    const nameInput = row.querySelector('.g-name');
+    nameInput.addEventListener('change', async () => {
+      const res = await saveGroup(id, { name: nameInput.value });
+      if (res?.error) {
+        $('g-error').textContent = res.error;
+        nameInput.value = groupById(vault.groups, id)?.name || '';
+      } else {
+        $('g-error').textContent = '';
+      }
+    });
+
+    row.querySelectorAll('.cat-sw').forEach((sw) => sw.addEventListener('click', async () => {
+      const res = await saveGroup(id, { color: sw.dataset.color });
+      if (res?.error) $('g-error').textContent = res.error;
+    }));
+
+    row.querySelector('.g-del').addEventListener('click', async () => {
+      await delGroup(id);
+      renderGroupManager();
+      renderVault();
+    });
+  });
+}
+
 /* ---------- entry editor ---------- */
 
 function openEntry(id) {
@@ -1199,6 +1439,10 @@ function openEntry(id) {
   $('e-url').value = src.url || '';
   $('e-notes').value = src.notes || '';
   $('e-error').textContent = '';
+  showInlineGroup(false);
+  // A new credential created while a group is filtered lands in that group —
+  // that is almost always what was meant.
+  fillGroupSelect(e ? src.groupId : (vault.groupFilter && vault.groupFilter !== UNGROUPED ? vault.groupFilter : ''));
   $('e-delete').classList.toggle('hidden', !e);
   hideSecretInput('e-password-eye');
   paintMeter('e-meter', null, src.password || '');
@@ -1211,7 +1455,8 @@ function closeEntry() {
   $('entry-ov').classList.remove('show');
   vault.editingId = null;
   // Don't leave a password in a hidden input waiting to be re-revealed.
-  ['e-title', 'e-username', 'e-password', 'e-url', 'e-notes'].forEach((id) => { $(id).value = ''; });
+  ['e-title', 'e-username', 'e-password', 'e-url', 'e-notes', 'e-group-name'].forEach((id) => { $(id).value = ''; });
+  showInlineGroup(false);
   hideSecretInput('e-password-eye');
   paintMeter('e-meter', null, '');
 }
@@ -1247,6 +1492,26 @@ $('e-save').addEventListener('click', () => { touchVault(); saveEntry(); });
 $('e-delete').addEventListener('click', () => { if (vault.editingId) deleteEntry(vault.editingId); });
 $('e-password').addEventListener('input', () => paintMeter('e-meter', null, $('e-password').value));
 $('entry-ov').addEventListener('click', (e) => { if (e.target.id === 'entry-ov') closeEntry(); });
+
+$('e-group-new').addEventListener('click', () => { touchVault(); showInlineGroup(true); });
+$('e-group-cancel').addEventListener('click', () => showInlineGroup(false));
+$('e-group-save').addEventListener('click', createGroupInline);
+$('e-group-name').addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter') { ev.preventDefault(); createGroupInline(); }
+  if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); showInlineGroup(false); }
+});
+
+$('group-x').addEventListener('click', () => $('group-ov').classList.remove('show'));
+$('group-ov').addEventListener('click', (e) => { if (e.target.id === 'group-ov') $('group-ov').classList.remove('show'); });
+$('g-new-btn').addEventListener('click', async () => {
+  const res = await addGroup($('g-new').value);
+  if (res?.error) { $('g-error').textContent = res.error; return; }
+  $('g-error').textContent = '';
+  $('g-new').value = '';
+  $('g-new').focus();
+  setTimeout(renderGroupManager, 300);
+});
+$('g-new').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('g-new-btn').click(); } });
 
 $('e-gen-len').addEventListener('input', () => { $('e-gen-len-label').textContent = $('e-gen-len').value; });
 $('e-gen').addEventListener('click', () => {
@@ -1307,6 +1572,7 @@ document.addEventListener('keydown', (e) => {
     $('menu-ov').classList.remove('show');
     $('cat-ov').classList.remove('show');
     if ($('entry-ov').classList.contains('show')) closeEntry();
+    $('group-ov').classList.remove('show');
   }
   if (e.key === '/' && !['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) {
     e.preventDefault();

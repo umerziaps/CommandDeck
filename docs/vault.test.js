@@ -24,6 +24,9 @@ import {
   createVaultConfig, unlockVault, passphraseCandidates, normalizePassphrase,
   plainPunctuation, hasSmartPunctuation,
   blankEntry, normaliseEntry, entryBody, entryOrder,
+  blankGroup, normaliseGroup, groupBody, groupOrder, groupById, validateGroup,
+  countByGroup, filterByGroup, sectionsByGroup, entryGroupId,
+  GROUP_PALETTE, UNGROUPED,
   validateEntry, validatePassphrase, vaultSearch,
   genPassword, passwordStrength, maskSecret, CHARSETS
 } from './vault.js';
@@ -186,7 +189,7 @@ test('additional authenticated data binds a blob to its entry id', async () => {
 test('normaliseEntry keeps only known fields and coerces the rest to strings', () => {
   const e = normaliseEntry('abc', {
     title: 'GitHub', username: 'umer', password: 'pw',
-    url: null, notes: undefined, catId: 7,
+    url: null, notes: undefined, groupId: 7,
     isAdmin: true, __proto__: { polluted: 1 }
   }, { createdAt: '2026-01-01T00:00:00Z' });
 
@@ -194,14 +197,14 @@ test('normaliseEntry keeps only known fields and coerces the rest to strings', (
   assert.equal(e.title, 'GitHub');
   assert.equal(e.url, '');            // null → ''
   assert.equal(e.notes, '');          // undefined → ''
-  assert.equal(e.catId, '');          // number → ''
+  assert.equal(e.groupId, '');        // number → ''
   assert.equal(e.isAdmin, undefined); // unknown field dropped
   assert.equal(e.updatedAt, '2026-01-01T00:00:00Z'); // defaults to createdAt
 });
 
 test('entryBody round-trips through normaliseEntry without gaining fields', () => {
   const body = entryBody({ ...blankEntry(), title: 'X', password: 'y', junk: 'no' });
-  assert.deepEqual(Object.keys(body).sort(), ['catId', 'notes', 'password', 'title', 'url', 'username']);
+  assert.deepEqual(Object.keys(body).sort(), ['groupId', 'notes', 'password', 'title', 'url', 'username']);
 });
 
 test('entries sort by name, ignoring case', () => {
@@ -490,4 +493,131 @@ test('the candidate list stays small enough that a failed unlock is not a hang',
   // Every candidate is a full PBKDF2 run at 310k rounds, so this bounds the
   // worst-case wait on a wrong passphrase.
   assert.ok(passphraseCandidates(CURLY).length <= 4, passphraseCandidates(CURLY).map((c) => c.form).join(','));
+});
+
+/* ---------- groups ---------- *
+ *
+ * A group is a folder over entries: "Ocufii staging VMs", "AWS". Its name and
+ * colour are encrypted like everything else, so these tests exercise the model
+ * rather than the storage — the ciphertext assertions above already cover
+ * what reaches the wire, and groups use the same blob shape.
+ */
+
+const G = (id, name, createdAt, color = '#5EE6C5') => ({ id, name, createdAt, color });
+const E = (id, title, groupId = '') => ({ id, title, groupId, createdAt: '2026-01-01T00:00:00Z' });
+
+test('a new entry is ungrouped', () => {
+  assert.equal(blankEntry().groupId, '');
+});
+
+test('groupId survives the encrypt/decrypt round trip through the entry body', async () => {
+  const { key } = await createVaultConfig(PASS, FAST);
+  const blob = await encryptJson(key, entryBody({ ...blankEntry(), title: 'db1', groupId: 'g-vms' }), { aad: 'e1' });
+  const back = normaliseEntry('e1', await decryptJson(key, blob, { aad: 'e1' }), {});
+  assert.equal(back.groupId, 'g-vms');
+});
+
+test('an entry written before groups existed reads as ungrouped, not broken', () => {
+  // Old bodies carried an unused catId. It must not survive, and its absence
+  // must not leave groupId undefined — the UI compares it against '' .
+  const e = normaliseEntry('e1', { title: 'old', catId: 'whatever' }, {});
+  assert.equal(e.groupId, '');
+  assert.equal(e.catId, undefined);
+});
+
+test('blankGroup walks the palette so two groups made in a row differ', () => {
+  assert.equal(blankGroup(0).color, GROUP_PALETTE[0]);
+  assert.equal(blankGroup(1).color, GROUP_PALETTE[1]);
+  assert.equal(blankGroup(GROUP_PALETTE.length).color, GROUP_PALETTE[0], 'palette must wrap, not run off the end');
+});
+
+test('normaliseGroup rejects a malformed colour rather than writing it into a style attribute', () => {
+  assert.equal(normaliseGroup('g1', { name: 'VMs', color: 'red; background:url(x)' }).color, GROUP_PALETTE[0]);
+  assert.equal(normaliseGroup('g1', { name: 'VMs', color: '#A1B2C3' }).color, '#A1B2C3');
+  assert.equal(normaliseGroup('g1', { name: 'VMs' }).color, GROUP_PALETTE[0]);
+});
+
+test('groupBody keeps only the two fields that belong in a group', () => {
+  assert.deepEqual(Object.keys(groupBody({ name: 'A', color: '#111111', secret: 'no' })).sort(), ['color', 'name']);
+});
+
+test('validateGroup requires a name and refuses a duplicate', () => {
+  const existing = [G('g1', 'AWS', '1'), G('g2', 'Ocufii VMs', '2')];
+  assert.equal(validateGroup({ name: '  ' }, existing).ok, false);
+  assert.equal(validateGroup({ name: 'Azure' }, existing).ok, true);
+  assert.equal(validateGroup({ name: 'aws' }, existing).ok, false, 'duplicates differing only in case are still duplicates');
+  assert.equal(validateGroup({ name: 'AWS' }, existing, 'g1').ok, true, 'renaming a group to its own name is not a clash');
+  assert.equal(validateGroup({ name: 'x'.repeat(61) }, existing).ok, false);
+});
+
+test('groups keep creation order, so renaming one does not reshuffle the list', () => {
+  const groups = [G('g2', 'Zulu', '2026-02-01'), G('g1', 'Alpha', '2026-01-01')];
+  assert.deepEqual([...groups].sort(groupOrder).map((g) => g.id), ['g1', 'g2']);
+});
+
+test('an entry pointing at a deleted group reads as ungrouped instead of vanishing', () => {
+  const groups = [G('g1', 'AWS', '1')];
+  assert.equal(entryGroupId(E('e1', 'a', 'g1'), groups), 'g1');
+  assert.equal(entryGroupId(E('e2', 'b', 'ghost'), groups), '', 'a dangling id must not hide the credential');
+  assert.equal(entryGroupId(E('e3', 'c'), groups), '');
+});
+
+test('counts cover every group, the empty ones included', () => {
+  const groups = [G('g1', 'AWS', '1'), G('g2', 'VMs', '2')];
+  const counts = countByGroup([E('e1', 'a', 'g1'), E('e2', 'b', 'g1'), E('e3', 'c')], groups);
+  assert.equal(counts.g1, 2);
+  assert.equal(counts.g2, 0, 'a group you just made must not be missing from the bar');
+  assert.equal(counts[UNGROUPED], 1);
+});
+
+test('a dangling group id is counted as ungrouped, not as its own phantom group', () => {
+  const counts = countByGroup([E('e1', 'a', 'ghost')], [G('g1', 'AWS', '1')]);
+  assert.equal(counts[UNGROUPED], 1);
+  assert.equal(counts.ghost, undefined);
+});
+
+test('filtering by group, by ungrouped, and by nothing', () => {
+  const groups = [G('g1', 'AWS', '1')];
+  const entries = [E('e1', 'a', 'g1'), E('e2', 'b'), E('e3', 'c', 'ghost')];
+  assert.deepEqual(filterByGroup(entries, groups, 'g1').map((e) => e.id), ['e1']);
+  assert.deepEqual(filterByGroup(entries, groups, UNGROUPED).map((e) => e.id), ['e2', 'e3']);
+  assert.equal(filterByGroup(entries, groups, '').length, 3);
+});
+
+test('sections appear in group order with ungrouped last', () => {
+  const groups = [G('g2', 'VMs', '2026-02-01'), G('g1', 'AWS', '2026-01-01')];
+  const secs = sectionsByGroup([E('e1', 'a', 'g1'), E('e2', 'b'), E('e3', 'c', 'g2')], groups);
+  assert.deepEqual(secs.map((s) => s.group?.name ?? 'Ungrouped'), ['AWS', 'VMs', 'Ungrouped']);
+  assert.deepEqual(secs.at(-1).entries.map((e) => e.id), ['e2']);
+});
+
+test('the ungrouped section is omitted when nothing is ungrouped', () => {
+  const groups = [G('g1', 'AWS', '1')];
+  const secs = sectionsByGroup([E('e1', 'a', 'g1')], groups);
+  assert.equal(secs.length, 1);
+  assert.equal(secs[0].group.id, 'g1');
+});
+
+test('empty groups still get a section, so a new group does not look like it failed', () => {
+  const secs = sectionsByGroup([], [G('g1', 'AWS', '1')]);
+  assert.equal(secs.length, 1);
+  assert.deepEqual(secs[0].entries, []);
+});
+
+test('sections never lose or duplicate an entry', () => {
+  const groups = [G('g1', 'AWS', '1'), G('g2', 'VMs', '2')];
+  const entries = [E('e1', 'a', 'g1'), E('e2', 'b', 'g2'), E('e3', 'c'), E('e4', 'd', 'ghost')];
+  const ids = sectionsByGroup(entries, groups).flatMap((s) => s.entries.map((e) => e.id)).sort();
+  assert.deepEqual(ids, ['e1', 'e2', 'e3', 'e4']);
+});
+
+test('entries are sorted by name inside each section', () => {
+  const groups = [G('g1', 'AWS', '1')];
+  const secs = sectionsByGroup([E('e1', 'zoom', 'g1'), E('e2', 'Apple', 'g1')], groups);
+  assert.deepEqual(secs[0].entries.map((e) => e.title), ['Apple', 'zoom']);
+});
+
+test('groupById returns null rather than undefined for a missing group', () => {
+  assert.equal(groupById([G('g1', 'AWS', '1')], 'nope'), null);
+  assert.equal(groupById([], 'g1'), null);
 });

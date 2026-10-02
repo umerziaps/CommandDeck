@@ -48,6 +48,14 @@ service cloud.firestore {
         allow read, delete: if isOwner(userId);
         allow create, update: if isOwner(userId) && validVaultEntry();
       }
+
+      // Group names are encrypted exactly like entries. A plaintext folder
+      // called "production database" would tell a reader what the credentials
+      // are FOR, which is often the more useful half of the secret.
+      match /vaultGroups/{groupId} {
+        allow read, delete: if isOwner(userId);
+        allow create, update: if isOwner(userId) && validVaultEntry();
+      }
     }
 
     // Anything not matched above is denied by default. Leave it that way.
@@ -83,6 +91,9 @@ service cloud.firestore {
           && d.createdAt is string;
     }
 
+    // Shared by vault entries and vault groups: both are nothing but a sealed
+    // blob plus timestamps. updatedAt is optional — a freshly created group
+    // has never been updated.
     function validVaultEntry() {
       let d = request.resource.data;
       return d.v is int
@@ -91,7 +102,10 @@ service cloud.firestore {
           && d.data.ct is string && d.data.ct.size() > 0 && d.data.ct.size() <= 100000
           && d.data.iv is string && d.data.iv.size() > 0 && d.data.iv.size() <= 32
           && d.createdAt is string
-          && d.updatedAt is string;
+          // Optional: a document that has never been edited has no updatedAt,
+          // which is how every group is born. Requiring it would reject group
+          // creation outright with a permission error.
+          && (!d.keys().hasAny(['updatedAt']) || d.updatedAt is string);
     }
 
     function validCategory() {
