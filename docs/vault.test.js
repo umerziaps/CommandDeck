@@ -22,6 +22,7 @@ import {
   toB64, fromB64, newSalt,
   deriveKey, encryptJson, decryptJson,
   createVaultConfig, unlockVault, passphraseCandidates, normalizePassphrase,
+  plainPunctuation, hasSmartPunctuation,
   blankEntry, normaliseEntry, entryBody, entryOrder,
   validateEntry, validatePassphrase, vaultSearch,
   genPassword, passwordStrength, maskSecret, CHARSETS
@@ -406,4 +407,87 @@ test('normalization does not silently fold a passphrase into a weaker one', () =
   // as the same passphrase. That is the documented trade for cross-platform
   // agreement; this test exists so the behaviour is deliberate, not a surprise.
   assert.equal(normalizePassphrase('ﬁnance', 'NFKC'), 'finance');
+});
+
+/* ---------- typographic substitution ---------- *
+ *
+ * The bug this covers, found in the field: a vault created on a machine with
+ * smart quotes off would not open on a machine with them on. macOS and iOS
+ * replace ' with ’ and - with – as you type. Same length on screen, same
+ * characters to the eye, different bytes into PBKDF2. The passphrase was
+ * pure ASCII on one machine and not on the other, and nothing in the UI
+ * could have shown the difference.
+ */
+
+const STRAIGHT = "don't lose this-one";
+const CURLY    = 'don’t lose this–one';   // ’ and en dash
+
+test('the two spellings differ in bytes but not in length', () => {
+  assert.notEqual(STRAIGHT, CURLY);
+  assert.equal(STRAIGHT.length, CURLY.length, 'same length is what makes this invisible');
+  assert.equal([...STRAIGHT].some((c) => c.codePointAt(0) > 127), false);
+  assert.equal([...CURLY].some((c) => c.codePointAt(0) > 127), true);
+});
+
+test('a vault created with straight quotes opens when the keyboard substitutes', async () => {
+  const { config } = await createVaultConfig(STRAIGHT, FAST);
+  const { key } = await unlockVault(CURLY, config);
+  assert.equal(await decryptJson(key, config.verifier), VERIFIER_PLAINTEXT);
+});
+
+test('and a vault created with substitution opens from a plain keyboard', async () => {
+  const { config } = await createVaultConfig(CURLY, FAST);
+  const { key } = await unlockVault(STRAIGHT, config);
+  assert.equal(await decryptJson(key, config.verifier), VERIFIER_PLAINTEXT);
+});
+
+test('a legacy vault with no recorded form recovers from substitution too', async () => {
+  // This is the case that actually happened: the vault predates the fix, so
+  // there is no form to follow and unlock has to find it.
+  const { config } = await createVaultConfig(STRAIGHT, { ...FAST, norm: 'raw' });
+  delete config.norm;
+  const { key, norm } = await unlockVault(CURLY, config);
+  assert.equal(await decryptJson(key, config.verifier), VERIFIER_PLAINTEXT);
+  assert.ok(norm.endsWith('+plain'), `expected a de-substituting form, got ${norm}`);
+});
+
+test('plainPunctuation covers the substitutions these keyboards actually make', () => {
+  assert.equal(plainPunctuation('‘a’'), "'a'");
+  assert.equal(plainPunctuation('“b”'), '"b"');
+  assert.equal(plainPunctuation('c–d—e−f'), 'c-d-e-f');
+  assert.equal(plainPunctuation('g h'), 'g h');
+  assert.equal(plainPunctuation('plain ascii'), 'plain ascii');
+});
+
+test('hasSmartPunctuation is stateless across repeated calls', () => {
+  // A /g regex advances lastIndex between .test() calls, which would make this
+  // alternate true/false on identical input. Called many times to catch it.
+  for (let i = 0; i < 10; i++) {
+    assert.equal(hasSmartPunctuation(CURLY), true, `flipped on call ${i}`);
+    assert.equal(hasSmartPunctuation(STRAIGHT), false, `flipped on call ${i}`);
+  }
+  assert.equal(hasSmartPunctuation(''), false);
+  assert.equal(hasSmartPunctuation(null), false);
+});
+
+test('substitution handling never rescues a genuinely wrong passphrase', async () => {
+  const { config } = await createVaultConfig(STRAIGHT, FAST);
+  await assert.rejects(() => unlockVault('dont lose this-one', config), WrongPassphraseError);
+  await assert.rejects(() => unlockVault("don't lose this one", config), WrongPassphraseError);
+  await assert.rejects(() => unlockVault("DON'T LOSE THIS-ONE", config), WrongPassphraseError);
+});
+
+test('case is never folded — that would spend real entropy', async () => {
+  const { config } = await createVaultConfig('Correct Horse Battery', FAST);
+  await assert.rejects(() => unlockVault('correct horse battery', config), WrongPassphraseError);
+});
+
+test('a plain ASCII passphrase still costs exactly one derivation', () => {
+  assert.equal(passphraseCandidates('plain ascii passphrase').length, 1);
+});
+
+test('the candidate list stays small enough that a failed unlock is not a hang', () => {
+  // Every candidate is a full PBKDF2 run at 310k rounds, so this bounds the
+  // worst-case wait on a wrong passphrase.
+  assert.ok(passphraseCandidates(CURLY).length <= 4, passphraseCandidates(CURLY).map((c) => c.form).join(','));
 });

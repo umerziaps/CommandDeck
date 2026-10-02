@@ -30,7 +30,7 @@ import {
   createVaultConfig, unlockVault, encryptJson, decryptJson,
   blankEntry, normaliseEntry, entryBody, entryOrder,
   validateEntry, validatePassphrase, vaultSearch,
-  genPassword, passwordStrength, maskSecret,
+  genPassword, passwordStrength, maskSecret, hasSmartPunctuation,
   WrongPassphraseError, VAULT_VERSION
 } from './vault.js';
 
@@ -830,6 +830,23 @@ function paintMeter(meterId, noteId, pw) {
   }
 }
 
+// macOS and iOS replace ' with ’ and - with – as you type, and the result is
+// indistinguishable on screen. The vault now opens with either, but it is
+// still worth saying out loud: the character on screen is not the one on the
+// key you pressed, and anything that copies the passphrase elsewhere — a
+// password manager, a note — will carry the substituted version.
+function paintSmartWarning(inputId, noteId) {
+  const warn = hasSmartPunctuation($(inputId).value);
+  const el = $(noteId);
+  if (!el) return;
+  el.classList.toggle('hidden', !warn);
+  el.textContent = warn
+    ? 'Your keyboard replaced a quote or hyphen with a typographic one (’ or –). '
+      + 'The vault accepts either spelling, but you can turn the substitution off in '
+      + 'System Settings → Keyboard → Text Input → Edit.'
+    : '';
+}
+
 async function createVault() {
   const pass = $('vs-pass').value;
   const check = validatePassphrase(pass, $('vs-pass2').value);
@@ -1206,7 +1223,12 @@ document.querySelectorAll('#view-tog button').forEach((b) =>
 
 ['vs-pass-eye', 'vl-pass-eye', 'e-password-eye'].forEach(wireEye);
 
-$('vs-pass').addEventListener('input', () => { paintMeter('vs-meter', 'vs-meter-note', $('vs-pass').value); setupReady(); });
+$('vs-pass').addEventListener('input', () => {
+  paintMeter('vs-meter', 'vs-meter-note', $('vs-pass').value);
+  paintSmartWarning('vs-pass', 'vs-smart');
+  setupReady();
+});
+$('vl-pass').addEventListener('input', () => paintSmartWarning('vl-pass', 'vl-smart'));
 $('vs-pass2').addEventListener('input', setupReady);
 $('vs-ack').addEventListener('change', setupReady);
 $('vs-create').addEventListener('click', createVault);

@@ -131,14 +131,15 @@
       <div class="vault-form">
         <label class="vault-label" for="vs-pass">Master passphrase</label>
         <div class="secret-row">
-          <input type="password" id="vs-pass" autocomplete="new-password" spellcheck="false" placeholder="At least 10 characters">
+          <input type="password" id="vs-pass" autocomplete="new-password" spellcheck="false" autocorrect="off" autocapitalize="off" placeholder="At least 10 characters">
           <button class="reveal" id="vs-pass-eye" type="button" aria-label="Show passphrase">show</button>
         </div>
         <div class="meter" id="vs-meter"><span></span></div>
+        <p class="smart-warn hidden" id="vs-smart"></p>
         <div class="meter-note" id="vs-meter-note">A phrase of four or five unrelated words beats a short cryptic one.</div>
 
         <label class="vault-label" for="vs-pass2">Type it again</label>
-        <input type="password" id="vs-pass2" autocomplete="new-password" spellcheck="false">
+        <input type="password" id="vs-pass2" autocomplete="new-password" spellcheck="false" autocorrect="off" autocapitalize="off">
 
         <label class="ack">
           <input type="checkbox" id="vs-ack">
@@ -160,9 +161,10 @@
       <p class="vault-who" id="vl-who"></p>
       <div class="vault-form">
         <div class="secret-row">
-          <input type="password" id="vl-pass" autocomplete="current-password" spellcheck="false" placeholder="Master passphrase" enterkeyhint="go">
+          <input type="password" id="vl-pass" autocomplete="current-password" spellcheck="false" autocorrect="off" autocapitalize="off" placeholder="Master passphrase" enterkeyhint="go">
           <button class="reveal" id="vl-pass-eye" type="button" aria-label="Show passphrase">show</button>
         </div>
+        <p class="smart-warn hidden" id="vl-smart"></p>
         <p class="vault-error" id="vl-error"></p>
         <button class="btn-primary" id="vl-unlock">Unlock</button>
       </div>
@@ -246,7 +248,7 @@
 
       <label class="vault-label" for="e-password">Password</label>
       <div class="secret-row">
-        <input type="password" id="e-password" autocomplete="new-password" spellcheck="false">
+        <input type="password" id="e-password" autocomplete="new-password" spellcheck="false" autocorrect="off" autocapitalize="off">
         <button class="reveal" id="e-password-eye" type="button" aria-label="Show password">show</button>
       </div>
       <div class="meter" id="e-meter"><span></span></div>

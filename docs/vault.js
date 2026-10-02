@@ -64,36 +64,82 @@ export const MIN_PASSPHRASE = 10;
 // throw rather than return garbage — so this is a cheap, data-free probe.
 export const VERIFIER_PLAINTEXT = 'command-deck-vault-v1';
 
-/* ---------- Unicode normalization ---------- *
+/* ---------- what the keyboard did to the passphrase ---------- *
  *
- * PBKDF2 consumes bytes, not characters, and the same passphrase can be
- * different bytes on different machines. "café" is five code points on macOS,
- * which stores it decomposed (e + combining acute), and four on Windows and
- * Linux, which compose it. Identical on screen, identical to the clipboard,
- * different to TextEncoder — so the key derived on one machine does not
- * decrypt what the other wrote, and the only symptom is "wrong passphrase".
+ * PBKDF2 consumes bytes, not characters, and the same passphrase typed by the
+ * same person can be different bytes on different machines. Two ways:
  *
- * New vaults pin NFKC and record it, so there is nothing to guess. Vaults
- * created before this existed have no recorded form, so unlock tries each
- * candidate until one authenticates, then reports which worked so the caller
- * can write it into the config and make the next unlock single-shot. The key
- * itself never changes, so nothing has to be re-encrypted.
+ *   Normalization. "café" is five code points on macOS, which stores it
+ *   decomposed (e + combining acute), and four on Windows and Linux, which
+ *   compose it.
+ *
+ *   Substitution. The operating system silently replaces straight quotes with
+ *   typographic ones and hyphens with dashes as you type: ' becomes ’, -
+ *   becomes –. On by default on macOS and iOS, off on Windows and Linux.
+ *
+ * In both cases the passphrase looks identical on screen, survives the
+ * clipboard unchanged, and derives a different key. The only symptom the user
+ * ever sees is "wrong passphrase" on one machine and not the other — which is
+ * exactly how this was found.
+ *
+ * New vaults canonicalize both and record the form, so there is nothing to
+ * guess. Older vaults have no recorded form, so unlock tries each candidate
+ * until one authenticates and reports which worked, so the caller can write it
+ * back. The key never changes, so nothing is re-encrypted.
+ *
+ * Folding ’ onto ' costs a sliver of entropy — it merges a handful of
+ * visually identical pairs. Set against a vault that cannot be opened on half
+ * your devices, that is a trade worth making, and it is made deliberately.
+ * Case is NOT folded: that would throw away real entropy from the one secret
+ * protecting everything else.
  */
-export const DEFAULT_NORM = 'NFKC';
+export const DEFAULT_NORM = 'NFKC+plain';
 const NORM_FORMS = ['NFC', 'NFD', 'NFKC', 'NFKD'];
 
-export function normalizePassphrase(pass, form) {
-  if (!form || form === 'raw') return pass;
-  return pass.normalize(form);
+const SMART = [
+  [/[‘’‚‛′]/g, "'"],   // ‘ ’ ‚ ‛ ′
+  [/[“”„‟″]/g, '"'],   // “ ” „ ‟ ″
+  [/[‐-―−]/g, '-'],              // ‐ ‑ ‒ – — ― −
+  [/…/g, '...'],                           // …
+  [/ /g, ' ']                              // no-break space
+];
+
+// A /g regex carries lastIndex across .test() calls, so testing with the same
+// objects used for .replace() would return a different answer every other
+// call. Non-global copies, built once, keep it stateless.
+const SMART_TEST = SMART.map(([re]) => new RegExp(re.source));
+export const hasSmartPunctuation = (s) => SMART_TEST.some((re) => re.test(s || ''));
+
+export function plainPunctuation(s) {
+  let out = s;
+  for (const [re, to] of SMART) out = out.replace(re, to);
+  return out;
 }
 
-// Distinct byte-forms of this passphrase, in the order worth trying: the raw
-// string first, since that is what vaults predating this function used.
+// A form is a normalization name, optionally suffixed "+plain" to mean the
+// typographic substitutions are undone first. 'raw' means the string as typed.
+export function normalizePassphrase(pass, form) {
+  if (!form || form === 'raw') return pass;
+  const [norm, ...flags] = String(form).split('+');
+  let out = flags.includes('plain') ? plainPunctuation(pass) : pass;
+  if (norm && norm !== 'raw') out = out.normalize(norm);
+  return out;
+}
+
+// Distinct byte-forms worth trying, raw first — that is what vaults predating
+// this used, and trying it first keeps their unlock a single derivation.
+// Duplicates are dropped, so a plain ASCII passphrase yields exactly one
+// candidate and costs exactly one PBKDF2 run.
 export function passphraseCandidates(pass) {
-  const out = [{ form: 'raw', value: pass }];
-  for (const form of NORM_FORMS) {
+  const forms = ['raw'];
+  for (const n of NORM_FORMS) forms.push(n);
+  forms.push('raw+plain');
+  for (const n of NORM_FORMS) forms.push(`${n}+plain`);
+
+  const out = [];
+  for (const form of forms) {
     let value;
-    try { value = pass.normalize(form); } catch (_) { continue; }
+    try { value = normalizePassphrase(pass, form); } catch (_) { continue; }
     if (!out.some((c) => c.value === value)) out.push({ form, value });
   }
   return out;
