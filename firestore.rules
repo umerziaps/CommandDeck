@@ -26,6 +26,28 @@ service cloud.firestore {
         allow read, delete: if isOwner(userId);
         allow create, update: if isOwner(userId) && validCategory();
       }
+
+      // ---- credentials vault ----
+      //
+      // These rules are a second line of defence, not the first. The vault's
+      // contents are encrypted client-side before they are written, so an
+      // attacker who defeats everything below still gets ciphertext. That is
+      // deliberate: rules are one careless edit away from being wrong, and
+      // this data is the kind where "mostly protected" is not a category.
+      //
+      // What the shape checks buy: they make it impossible for a bug — or a
+      // client that has been tampered with — to write a vault document whose
+      // body is plaintext. A document without a `data.ct` string is rejected.
+
+      match /vaultMeta/{docId} {
+        allow read, delete: if isOwner(userId);
+        allow create, update: if isOwner(userId) && validVaultConfig();
+      }
+
+      match /vault/{entryId} {
+        allow read, delete: if isOwner(userId);
+        allow create, update: if isOwner(userId) && validVaultEntry();
+      }
     }
 
     // Anything not matched above is denied by default. Leave it that way.
@@ -47,6 +69,29 @@ service cloud.firestore {
           && d.order is number
           && d.subs is list
           && d.subs.size() <= 200;
+    }
+
+    // The vault's shape checks ARE security-relevant, unlike the two above:
+    // they are what stops a plaintext password from ever being stored, even
+    // by accident. A document is only accepted if its body is a sealed blob.
+    function validVaultConfig() {
+      let d = request.resource.data;
+      return d.v is int
+          && d.salt is string && d.salt.size() >= 16 && d.salt.size() <= 64
+          && d.iterations is int && d.iterations >= 100000
+          && d.verifier.ct is string && d.verifier.iv is string
+          && d.createdAt is string;
+    }
+
+    function validVaultEntry() {
+      let d = request.resource.data;
+      return d.v is int
+          && d.keys().hasOnly(['v', 'data', 'createdAt', 'updatedAt'])
+          && d.data.keys().hasOnly(['ct', 'iv'])
+          && d.data.ct is string && d.data.ct.size() > 0 && d.data.ct.size() <= 100000
+          && d.data.iv is string && d.data.iv.size() > 0 && d.data.iv.size() <= 32
+          && d.createdAt is string
+          && d.updatedAt is string;
     }
 
     function validCategory() {

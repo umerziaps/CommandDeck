@@ -16,7 +16,7 @@ import {
 } from 'https://www.gstatic.com/firebasejs/12.17.1/firebase-auth.js';
 import {
   initializeFirestore, getFirestore, persistentLocalCache, persistentMultipleTabManager,
-  collection, doc, setDoc, updateDoc, deleteDoc, onSnapshot, writeBatch, getDocs
+  collection, doc, getDoc, setDoc, updateDoc, deleteDoc, onSnapshot, writeBatch, getDocs
 } from 'https://www.gstatic.com/firebasejs/12.17.1/firebase-firestore.js';
 
 import { firebaseConfig } from './firebase-config.js';
@@ -26,6 +26,13 @@ import {
   normaliseItem, boardOrder, nextOrder, liftedOrder,
   matchesFilter, visibleItems
 } from './lib.js';
+import {
+  createVaultConfig, unlockVault, encryptJson, decryptJson,
+  blankEntry, normaliseEntry, entryBody, entryOrder,
+  validateEntry, validatePassphrase, vaultSearch,
+  genPassword, passwordStrength, maskSecret,
+  WrongPassphraseError, VAULT_VERSION
+} from './vault.js';
 
 /* ------------------------------------------------------------------ *
  * SCHEMA — keep in lockstep with the Swift side (FirestoreItem.swift)
@@ -125,10 +132,32 @@ const state = {
 let unsubItems = null;
 let unsubCats = null;
 
+// The vault's own slice of state. `key` is a non-extractable CryptoKey and
+// lives nowhere else — not localStorage, not sessionStorage, not a cookie.
+// Closing the tab loses it, which is the point.
+const vault = {
+  config: null,     // the vaultMeta/config document, or null before first run
+  key: null,        // CryptoKey while unlocked, null while locked
+  entries: [],      // decrypted, in memory only
+  revealed: {},     // entryId -> true while its password is on screen
+  query: '',
+  editingId: null,  // null means "new entry"
+  unsub: null,
+  gen: 0,           // guards against an out-of-order async snapshot render
+  idleTimer: null,
+  clipTimer: null
+};
+
+const AUTOLOCK_MS = 10 * 60 * 1000;
+const CLIPBOARD_CLEAR_MS = 25 * 1000;
+
 const itemsCol = () => collection(db, 'users', state.user.uid, 'items');
 const catsCol  = () => collection(db, 'users', state.user.uid, 'categories');
 const itemRef  = (id) => doc(db, 'users', state.user.uid, 'items', id);
 const catRef   = (id) => doc(db, 'users', state.user.uid, 'categories', id);
+const vaultCol = () => collection(db, 'users', state.user.uid, 'vault');
+const vaultRef = (id) => doc(db, 'users', state.user.uid, 'vault', id);
+const vaultCfgRef = () => doc(db, 'users', state.user.uid, 'vaultMeta', 'config');
 const catOf    = (id) => state.cats.find((c) => c.id === id) || null;
 
 /* ---------- auth ---------- */
@@ -165,6 +194,11 @@ onAuthStateChanged(auth, (user) => {
 
   $('boot').classList.add('hidden');
 
+  // Signing out must drop the key, not just hide the UI — another account
+  // signing in on this tab would otherwise inherit a live vault session.
+  lockVault();
+  vault.config = null;
+
   if (!user) {
     state.items = []; state.cats = [];
     $('app').classList.add('hidden');
@@ -177,7 +211,8 @@ onAuthStateChanged(auth, (user) => {
   $('who').textContent = user.email || user.displayName || user.uid;
 
   subscribe();
-  $('cap-input').focus();
+  loadVaultConfig();
+  setView('board');
 });
 
 /* ---------- live data ---------- */
@@ -723,6 +758,452 @@ async function handleImport(e) {
   }
 }
 
+/* ================================================================== *
+ * VAULT
+ *
+ * Firestore is treated as hostile storage here. Every byte of an entry is
+ * encrypted in this tab before it is written, and the key that decrypts it
+ * is derived from a passphrase that is never transmitted or persisted.
+ * See docs/vault.js for the reasoning and docs/vault.test.js for the proof.
+ * ================================================================== */
+
+/* ---------- view switching ---------- */
+
+let currentView = 'board';
+
+function setView(v) {
+  currentView = v;
+  $('board-view').classList.toggle('hidden', v !== 'board');
+  $('vault-view').classList.toggle('hidden', v !== 'vault');
+  document.querySelectorAll('#view-tog button')
+    .forEach((b) => b.classList.toggle('on', b.dataset.view === v));
+
+  if (v === 'vault') { renderVault(); focusVault(); }
+  else $('cap-input').focus();
+}
+
+function focusVault() {
+  if (!vault.config) $('vs-pass').focus();
+  else if (!vault.key) $('vl-pass').focus();
+  else $('v-search').focus();
+}
+
+/* ---------- config load ---------- */
+
+// Read once per sign-in. The config document is not secret — it is a salt,
+// an iteration count and a verifier blob — so there is nothing lost by
+// fetching it before the passphrase is known.
+async function loadVaultConfig() {
+  try {
+    const snap = await getDoc(vaultCfgRef());
+    vault.config = snap.exists() ? snap.data() : null;
+  } catch (err) {
+    console.error(err);
+    vault.config = null;
+    toast('Could not reach the vault — check the Firestore rules');
+  }
+  if (currentView === 'vault') renderVault();
+}
+
+/* ---------- setup ---------- */
+
+function setupReady() {
+  const pass = $('vs-pass').value;
+  const ok = validatePassphrase(pass, $('vs-pass2').value).ok && $('vs-ack').checked;
+  $('vs-create').disabled = !ok;
+}
+
+function paintMeter(meterId, noteId, pw) {
+  const { score, label, bits } = passwordStrength(pw);
+  $(meterId).dataset.score = pw ? String(score) : '0';
+  if (noteId) {
+    $(noteId).textContent = pw
+      ? `${label} — about ${bits} bits of entropy`
+      : 'A phrase of four or five unrelated words beats a short cryptic one.';
+  }
+}
+
+async function createVault() {
+  const pass = $('vs-pass').value;
+  const check = validatePassphrase(pass, $('vs-pass2').value);
+  if (!check.ok) { $('vs-error').textContent = check.error; return; }
+  if (!$('vs-ack').checked) { $('vs-error').textContent = 'Please confirm you understand the recovery warning.'; return; }
+
+  $('vs-error').textContent = '';
+  $('vs-create').disabled = true;
+  $('vs-create').textContent = 'Deriving key…';   // 310k rounds is a visible pause
+
+  try {
+    const { key, config } = await createVaultConfig(pass);
+    await setDoc(vaultCfgRef(), config);
+    vault.config = config;
+    vault.key = key;
+    clearPassphraseInputs();
+    startAutolock();
+    subscribeVault();
+    renderVault();
+    toast('Vault created', true);
+  } catch (err) {
+    console.error(err);
+    $('vs-error').textContent = `Could not create the vault: ${err?.message || err}`;
+  } finally {
+    $('vs-create').textContent = 'Create vault';
+    setupReady();
+  }
+}
+
+/* ---------- unlock / lock ---------- */
+
+async function doUnlock() {
+  const pass = $('vl-pass').value;
+  if (!pass) { $('vl-error').textContent = 'Enter your passphrase.'; return; }
+
+  $('vl-error').textContent = '';
+  $('vl-unlock').disabled = true;
+  $('vl-unlock').textContent = 'Deriving key…';
+
+  try {
+    vault.key = await unlockVault(pass, vault.config);
+    clearPassphraseInputs();
+    startAutolock();
+    subscribeVault();
+    renderVault();
+    $('v-search').focus();
+  } catch (err) {
+    vault.key = null;
+    $('vl-error').textContent = err instanceof WrongPassphraseError
+      ? 'That passphrase does not unlock this vault.'
+      : `Unlock failed: ${err?.message || err}`;
+    $('vl-pass').select();
+  } finally {
+    $('vl-unlock').disabled = false;
+    $('vl-unlock').textContent = 'Unlock';
+  }
+}
+
+function lockVault(reason) {
+  vault.key = null;
+  vault.entries = [];
+  vault.revealed = {};
+  vault.query = '';
+  vault.editingId = null;
+  vault.gen++;                      // orphan any snapshot decryption in flight
+  if (vault.unsub) { vault.unsub(); vault.unsub = null; }
+  if (vault.idleTimer) { clearTimeout(vault.idleTimer); vault.idleTimer = null; }
+  $('entry-ov').classList.remove('show');
+  $('v-search').value = '';
+  clearPassphraseInputs();
+  $('vl-lede').textContent = reason || 'Enter your master passphrase to decrypt.';
+  // Always, not just when the vault is the visible tab — locking while the
+  // board is on screen must still empty the vault's markup.
+  renderVault();
+}
+
+// Passphrases are read out of the DOM and then removed from it. The string
+// itself still exists until the engine collects it — JavaScript gives no way
+// to wipe memory — but it should not be sitting in an input anyone can
+// un-hide, and it must never reach a form autofill heuristic.
+function clearPassphraseInputs() {
+  ['vs-pass', 'vs-pass2', 'vl-pass'].forEach((id) => { if ($(id)) $(id).value = ''; });
+  ['vs-pass-eye', 'vl-pass-eye'].forEach((id) => hideSecretInput(id));
+  if ($('vs-ack')) $('vs-ack').checked = false;
+  paintMeter('vs-meter', 'vs-meter-note', '');
+  setupReady();
+}
+
+function startAutolock() {
+  if (vault.idleTimer) clearTimeout(vault.idleTimer);
+  vault.idleTimer = setTimeout(() => lockVault('Locked after 10 minutes of inactivity.'), AUTOLOCK_MS);
+}
+const touchVault = () => { if (vault.key) startAutolock(); };
+
+/* ---------- live data ---------- */
+
+function subscribeVault() {
+  if (vault.unsub) vault.unsub();
+  const myGen = ++vault.gen;
+
+  vault.unsub = onSnapshot(vaultCol(), async (snap) => {
+    const key = vault.key;
+    if (!key) return;
+
+    // Decryption is async and a second snapshot can land mid-flight, so the
+    // result is discarded unless it is still the newest one.
+    const decrypted = await Promise.all(snap.docs.map(async (d) => {
+      try {
+        const body = await decryptJson(key, d.data().data, { aad: d.id });
+        return normaliseEntry(d.id, body, d.data());
+      } catch (_) {
+        // One unreadable document must not blank the whole list.
+        return normaliseEntry(d.id, { title: '⚠︎ Unreadable entry' }, d.data());
+      }
+    }));
+
+    if (myGen !== vault.gen || !vault.key) return;
+    vault.entries = decrypted.sort(entryOrder);
+    if (currentView === 'vault') renderVault();
+  }, (err) => {
+    console.error(err);
+    toast('Could not read the vault — check the Firestore rules');
+  });
+}
+
+/* ---------- writes ---------- */
+
+async function saveEntry() {
+  if (!vault.key) return;
+
+  const entry = {
+    title: $('e-title').value.trim(),
+    username: $('e-username').value.trim(),
+    password: $('e-password').value,
+    url: $('e-url').value.trim(),
+    notes: $('e-notes').value,
+    catId: ''
+  };
+
+  const check = validateEntry(entry);
+  if (!check.ok) { $('e-error').textContent = check.error; return; }
+  $('e-error').textContent = '';
+
+  const id = vault.editingId || uid('v');
+  const now = new Date().toISOString();
+  const existing = vault.entries.find((e) => e.id === id);
+
+  try {
+    const data = await encryptJson(vault.key, entryBody(entry), { aad: id });
+    await setDoc(vaultRef(id), {
+      v: VAULT_VERSION,
+      data,
+      createdAt: existing?.createdAt || now,
+      updatedAt: now
+    });
+    closeEntry();
+    toast(vault.editingId ? 'Saved' : 'Added to vault', true);
+  } catch (err) {
+    console.error(err);
+    $('e-error').textContent = `Could not save: ${err?.message || err}`;
+  }
+}
+
+async function deleteEntry(id) {
+  const e = vault.entries.find((x) => x.id === id);
+  const ok = await askConfirm(
+    `"${e?.title || 'This entry'}" will be deleted from every device. There is no undo.`,
+    'Delete credential?'
+  );
+  if (!ok) return;
+  try {
+    await deleteDoc(vaultRef(id));
+    delete vault.revealed[id];
+    closeEntry();
+    toast('Deleted', true);
+  } catch (err) { console.error(err); toast('Delete failed'); }
+}
+
+/* ---------- clipboard ---------- */
+
+// A password sitting in the clipboard is a password one accidental paste
+// away from a chat window, so it is taken back out again.
+async function copySecret(text, label) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (_) {
+    toast('This browser blocked the clipboard — reveal and copy by hand');
+    return;
+  }
+  toast(`${label} copied — clears in ${CLIPBOARD_CLEAR_MS / 1000}s`, true);
+
+  if (vault.clipTimer) clearTimeout(vault.clipTimer);
+  vault.clipTimer = setTimeout(async () => {
+    try {
+      // Prefer to clear only if our value is still there. Most browsers deny
+      // clipboard reads, in which case the secret wins over the convenience
+      // of whatever was copied since.
+      let stillOurs = true;
+      try { stillOurs = (await navigator.clipboard.readText()) === text; } catch (_) {}
+      if (stillOurs) await navigator.clipboard.writeText('');
+    } catch (_) {}
+  }, CLIPBOARD_CLEAR_MS);
+}
+
+/* ---------- reveal toggles ---------- */
+
+function hideSecretInput(eyeId) {
+  const btn = $(eyeId);
+  if (!btn) return;
+  const input = $(eyeId.replace(/-eye$/, ''));
+  if (!input) return;
+  input.type = 'password';
+  input.classList.remove('shown');
+  btn.textContent = 'show';
+}
+
+function wireEye(eyeId) {
+  const btn = $(eyeId);
+  const input = $(eyeId.replace(/-eye$/, ''));
+  btn.addEventListener('click', () => {
+    const show = input.type === 'password';
+    input.type = show ? 'text' : 'password';
+    input.classList.toggle('shown', show);
+    btn.textContent = show ? 'hide' : 'show';
+    input.focus();
+  });
+}
+
+/* ---------- render ---------- */
+
+function renderVault() {
+  const hasConfig = !!vault.config;
+  const unlocked = !!vault.key;
+
+  $('vault-setup').classList.toggle('hidden', hasConfig);
+  $('vault-lock').classList.toggle('hidden', !hasConfig || unlocked);
+  $('vault-main').classList.toggle('hidden', !unlocked);
+
+  if (!unlocked) {
+    // Hiding the list is not enough. Decrypted values left in the document
+    // are still there for devtools, an extension, or a DOM-scraping bug to
+    // read, so once the key is gone the markup goes with it.
+    $('v-list').innerHTML = '';
+    $('v-autolock-note').textContent = '';
+    return;
+  }
+
+  const shown = vaultSearch(vault.entries, vault.query);
+
+  $('v-autolock-note').textContent = vault.entries.length
+    ? `${vault.entries.length} credential${vault.entries.length === 1 ? '' : 's'} · encrypted in this browser · locks itself after 10 minutes idle`
+    : '';
+
+  if (!shown.length) {
+    $('v-list').innerHTML = `<div class="v-empty">${
+      vault.entries.length
+        ? 'Nothing matches that search.'
+        : 'Nothing here yet.<br>Everything you add is encrypted before it leaves this browser.'
+    }</div>`;
+    return;
+  }
+
+  $('v-list').innerHTML = shown.map((e) => {
+    const revealed = !!vault.revealed[e.id];
+    const initial = esc((e.title || '?').trim().charAt(0).toUpperCase() || '?');
+    const sub = e.username || e.url || '—';
+    return `
+      <div class="v-row${revealed ? ' revealed' : ''}" data-id="${esc(e.id)}">
+        <div class="v-badge">${initial}</div>
+        <div class="v-main">
+          <div class="v-name">${esc(e.title)}</div>
+          <div class="v-user">${esc(sub)}</div>
+          <div class="v-secret">${revealed ? esc(e.password || '(no password saved)') : esc(maskSecret(e.password))}</div>
+        </div>
+        <div class="v-acts">
+          <button class="v-act" data-act="reveal">${revealed ? 'hide' : 'show'}</button>
+          <button class="v-act" data-act="copy">copy</button>
+          <button class="v-act" data-act="edit">edit</button>
+        </div>
+      </div>`;
+  }).join('');
+
+  $('v-list').querySelectorAll('.v-row').forEach((row) => {
+    const id = row.dataset.id;
+    row.querySelectorAll('.v-act').forEach((btn) => btn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      touchVault();
+      const e = vault.entries.find((x) => x.id === id);
+      if (!e) return;
+      if (btn.dataset.act === 'reveal') {
+        if (vault.revealed[id]) delete vault.revealed[id]; else vault.revealed[id] = true;
+        renderVault();
+      } else if (btn.dataset.act === 'copy') {
+        if (!e.password) { toast('No password saved on this entry'); return; }
+        copySecret(e.password, 'Password');
+      } else {
+        openEntry(id);
+      }
+    }));
+  });
+}
+
+/* ---------- entry editor ---------- */
+
+function openEntry(id) {
+  const e = id ? vault.entries.find((x) => x.id === id) : null;
+  const src = e || blankEntry();
+  vault.editingId = e ? id : null;
+
+  $('entry-title').textContent = e ? 'Edit credential' : 'New credential';
+  $('e-title').value = src.title || '';
+  $('e-username').value = src.username || '';
+  $('e-password').value = src.password || '';
+  $('e-url').value = src.url || '';
+  $('e-notes').value = src.notes || '';
+  $('e-error').textContent = '';
+  $('e-delete').classList.toggle('hidden', !e);
+  hideSecretInput('e-password-eye');
+  paintMeter('e-meter', null, src.password || '');
+
+  $('entry-ov').classList.add('show');
+  $('e-title').focus();
+}
+
+function closeEntry() {
+  $('entry-ov').classList.remove('show');
+  vault.editingId = null;
+  // Don't leave a password in a hidden input waiting to be re-revealed.
+  ['e-title', 'e-username', 'e-password', 'e-url', 'e-notes'].forEach((id) => { $(id).value = ''; });
+  hideSecretInput('e-password-eye');
+  paintMeter('e-meter', null, '');
+}
+
+/* ---------- vault wiring ---------- */
+
+document.querySelectorAll('#view-tog button').forEach((b) =>
+  b.addEventListener('click', () => setView(b.dataset.view)));
+
+['vs-pass-eye', 'vl-pass-eye', 'e-password-eye'].forEach(wireEye);
+
+$('vs-pass').addEventListener('input', () => { paintMeter('vs-meter', 'vs-meter-note', $('vs-pass').value); setupReady(); });
+$('vs-pass2').addEventListener('input', setupReady);
+$('vs-ack').addEventListener('change', setupReady);
+$('vs-create').addEventListener('click', createVault);
+$('vs-pass2').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !$('vs-create').disabled) createVault(); });
+
+$('vl-unlock').addEventListener('click', doUnlock);
+$('vl-pass').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); doUnlock(); } });
+
+$('v-search').addEventListener('input', () => { vault.query = $('v-search').value; touchVault(); renderVault(); });
+$('v-new').addEventListener('click', () => { touchVault(); openEntry(null); });
+$('v-lock-now').addEventListener('click', () => lockVault('Locked.'));
+
+$('entry-x').addEventListener('click', closeEntry);
+$('e-cancel').addEventListener('click', closeEntry);
+$('e-save').addEventListener('click', () => { touchVault(); saveEntry(); });
+$('e-delete').addEventListener('click', () => { if (vault.editingId) deleteEntry(vault.editingId); });
+$('e-password').addEventListener('input', () => paintMeter('e-meter', null, $('e-password').value));
+$('entry-ov').addEventListener('click', (e) => { if (e.target.id === 'entry-ov') closeEntry(); });
+
+$('e-gen-len').addEventListener('input', () => { $('e-gen-len-label').textContent = $('e-gen-len').value; });
+$('e-gen').addEventListener('click', () => {
+  touchVault();
+  const pw = genPassword({
+    length: Number($('e-gen-len').value) || 20,
+    symbols: $('e-gen-sym').checked
+  });
+  const input = $('e-password');
+  input.value = pw;
+  input.type = 'text';
+  input.classList.add('shown');
+  $('e-password-eye').textContent = 'hide';
+  paintMeter('e-meter', null, pw);
+});
+
+// Any deliberate interaction inside the vault postpones the auto-lock.
+// Scrolling and mouse movement deliberately do not — leaving the vault open
+// under a moving cursor should still lock it.
+['keydown', 'pointerdown'].forEach((ev) =>
+  $('vault-view').addEventListener(ev, touchVault, true));
+
 /* ---------- wiring ---------- */
 
 $('cap-add').addEventListener('click', () => { capture(); $('cap-input').focus(); });
@@ -760,10 +1241,18 @@ document.addEventListener('keydown', (e) => {
     settleConfirm(false);
     $('menu-ov').classList.remove('show');
     $('cat-ov').classList.remove('show');
+    if ($('entry-ov').classList.contains('show')) closeEntry();
   }
   if (e.key === '/' && !['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) {
     e.preventDefault();
-    $('cap-input').focus();
+    (currentView === 'vault' && vault.key ? $('v-search') : $('cap-input')).focus();
+  }
+  // Cmd/Ctrl-L locks the vault from anywhere, the way a screen lock should be
+  // reachable without hunting for a button.
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'l' && vault.key) {
+    e.preventDefault();
+    lockVault('Locked.');
+    setView('vault');
   }
 });
 
