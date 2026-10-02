@@ -27,3 +27,6 @@ node_modules/
 # Firebase config files: injected by CI from secrets (with a stub fallback),
 # kept locally by you. See CI-CD.md.
 CommandDeck/GoogleService-Info.plist
+
+# Firestore rules tests pull in the emulator and the Firebase SDK
+tests/rules/node_modules/
