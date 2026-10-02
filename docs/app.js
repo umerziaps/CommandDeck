@@ -141,6 +141,8 @@ const vault = {
   entries: [],      // decrypted, in memory only
   revealed: {},     // entryId -> true while its password is on screen
   query: '',
+  configError: null, // set when the config could not be READ, which is not
+                     // the same as the vault not existing
   editingId: null,  // null means "new entry"
   unsub: null,
   gen: 0,           // guards against an out-of-order async snapshot render
@@ -794,15 +796,20 @@ function focusVault() {
 // an iteration count and a verifier blob — so there is nothing lost by
 // fetching it before the passphrase is known.
 async function loadVaultConfig() {
+  vault.configError = null;
   try {
     const snap = await getDoc(vaultCfgRef());
     vault.config = snap.exists() ? snap.data() : null;
   } catch (err) {
     console.error(err);
+    // Crucially NOT `config = null`. "I could not read it" and "it does not
+    // exist" look identical to the UI, and treating the first as the second
+    // puts the setup screen in front of someone who already has a vault —
+    // one click from overwriting its salt and orphaning every entry.
     vault.config = null;
-    toast('Could not reach the vault — check the Firestore rules');
+    vault.configError = err?.message || String(err);
   }
-  if (currentView === 'vault') renderVault();
+  renderVault();
 }
 
 /* ---------- setup ---------- */
@@ -834,6 +841,21 @@ async function createVault() {
   $('vs-create').textContent = 'Deriving key…';   // 310k rounds is a visible pause
 
   try {
+    // Re-read immediately before writing. Creating a second vault would
+    // replace the salt and verifier, and every existing entry — still sitting
+    // in Firestore, still encrypted under the old key — would become
+    // permanently unreadable. The window is small (a stale read, a second tab,
+    // another machine mid-setup) but the damage is total, so it is checked.
+    const existing = await getDoc(vaultCfgRef());
+    if (existing.exists()) {
+      vault.config = existing.data();
+      $('vs-error').textContent =
+        'A vault already exists on this account — unlock it with its passphrase instead. '
+        + 'Creating a new one here would make the entries you already have unreadable.';
+      renderVault();
+      return;
+    }
+
     const { key, config } = await createVaultConfig(pass);
     await setDoc(vaultCfgRef(), config);
     vault.config = config;
@@ -863,7 +885,18 @@ async function doUnlock() {
   $('vl-unlock').textContent = 'Deriving key…';
 
   try {
-    vault.key = await unlockVault(pass, vault.config);
+    const { key, norm } = await unlockVault(pass, vault.config);
+    vault.key = key;
+
+    // Vaults created before normalization was pinned have to guess the
+    // byte-form each time. Record the one that worked so the next unlock is
+    // a single derivation. The key is unchanged, so nothing is re-encrypted.
+    if (!vault.config.norm && norm) {
+      updateDoc(vaultCfgRef(), { norm })
+        .then(() => { vault.config = { ...vault.config, norm }; })
+        .catch((e) => console.warn('Could not record the passphrase encoding:', e));
+    }
+
     clearPassphraseInputs();
     startAutolock();
     subscribeVault();
@@ -1056,10 +1089,20 @@ function wireEye(eyeId) {
 function renderVault() {
   const hasConfig = !!vault.config;
   const unlocked = !!vault.key;
+  const broken = !!vault.configError && !hasConfig;
 
-  $('vault-setup').classList.toggle('hidden', hasConfig);
+  $('vault-error').classList.toggle('hidden', !broken);
+  $('vault-setup').classList.toggle('hidden', hasConfig || broken);
   $('vault-lock').classList.toggle('hidden', !hasConfig || unlocked);
   $('vault-main').classList.toggle('hidden', !unlocked);
+
+  if (broken) $('ve-detail').textContent = vault.configError;
+
+  // The vault follows the Google account, so a vault that "won't open" is
+  // very often the wrong account rather than the wrong passphrase. Saying
+  // which one is signed in costs a line and answers that before it is asked.
+  const who = state.user?.email || state.user?.displayName || '';
+  ['vs-who', 'vl-who'].forEach((id) => { if ($(id)) $(id).textContent = who ? `Signed in as ${who}` : ''; });
 
   if (!unlocked) {
     // Hiding the list is not enough. Decrypted values left in the document

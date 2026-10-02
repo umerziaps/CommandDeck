@@ -16,12 +16,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  VAULT_VERSION, PBKDF2_ITERATIONS, MIN_PASSPHRASE, VERIFIER_PLAINTEXT,
+  VAULT_VERSION, PBKDF2_ITERATIONS, MIN_PASSPHRASE, VERIFIER_PLAINTEXT, DEFAULT_NORM,
   SALT_BYTES, IV_BYTES,
   WrongPassphraseError, CorruptEntryError,
   toB64, fromB64, newSalt,
   deriveKey, encryptJson, decryptJson,
-  createVaultConfig, unlockVault,
+  createVaultConfig, unlockVault, passphraseCandidates, normalizePassphrase,
   blankEntry, normaliseEntry, entryBody, entryOrder,
   validateEntry, validatePassphrase, vaultSearch,
   genPassword, passwordStrength, maskSecret, CHARSETS
@@ -72,7 +72,7 @@ test('createVaultConfig then unlockVault accepts the right passphrase', async ()
   assert.equal(config.iterations, 1000);
   assert.ok(config.createdAt);
 
-  const key = await unlockVault(PASS, config);
+  const { key } = await unlockVault(PASS, config);
   assert.equal(await decryptJson(key, config.verifier), VERIFIER_PLAINTEXT);
 });
 
@@ -89,7 +89,7 @@ test('unlockVault rejects an empty passphrase rather than unlocking', async () =
 test('unlockVault falls back to the default iteration count when the config omits it', async () => {
   const { config } = await createVaultConfig(PASS, { iterations: PBKDF2_ITERATIONS });
   delete config.iterations;
-  const key = await unlockVault(PASS, config);           // slow, but only once
+  const { key } = await unlockVault(PASS, config);       // slow, but only once
   assert.equal(await decryptJson(key, config.verifier), VERIFIER_PLAINTEXT);
 });
 
@@ -322,4 +322,88 @@ test('masking reveals nothing about the value, only that there is one', () => {
 
 test('the shipped iteration count meets the current OWASP floor for PBKDF2-SHA256', () => {
   assert.ok(PBKDF2_ITERATIONS >= 310_000, `iterations too low: ${PBKDF2_ITERATIONS}`);
+});
+
+/* ---------- Unicode normalization ---------- *
+ *
+ * The bug these cover: "café" is 5 code points on macOS (NFD: e + combining
+ * acute) and 4 on Windows and Linux (NFC). Identical on screen, identical
+ * through the clipboard, different bytes into PBKDF2 — so a vault created on
+ * one refuses the correct passphrase on the other, reporting only "wrong
+ * passphrase". Nothing in the original tests could have caught it: they
+ * derived and verified on the same machine, with the same string.
+ */
+
+const CAFE_NFC = 'café gratitude plan';          // é as one code point
+const CAFE_NFD = 'café gratitude plan';         // e + combining acute
+
+test('the two spellings of the same passphrase really are different bytes', () => {
+  assert.notEqual(CAFE_NFC, CAFE_NFD, 'test fixture is wrong — these must differ');
+  assert.equal(CAFE_NFC.normalize('NFC'), CAFE_NFD.normalize('NFC'), 'and must agree once normalized');
+});
+
+test('a vault created on one platform opens with the other platform\'s spelling', async () => {
+  const { config } = await createVaultConfig(CAFE_NFD, FAST);   // "created on macOS"
+  const { key } = await unlockVault(CAFE_NFC, config);          // "opened on Windows"
+  assert.equal(await decryptJson(key, config.verifier), VERIFIER_PLAINTEXT);
+});
+
+test('and the same in reverse', async () => {
+  const { config } = await createVaultConfig(CAFE_NFC, FAST);
+  const { key } = await unlockVault(CAFE_NFD, config);
+  assert.equal(await decryptJson(key, config.verifier), VERIFIER_PLAINTEXT);
+});
+
+test('new vaults pin a normalization form so later unlocks need no guessing', async () => {
+  const { config } = await createVaultConfig(PASS, FAST);
+  assert.equal(config.norm, DEFAULT_NORM);
+  const { norm } = await unlockVault(PASS, config);
+  assert.equal(norm, DEFAULT_NORM);
+});
+
+test('a legacy config without a form reports which one worked, so it can be recorded', async () => {
+  const { config } = await createVaultConfig(CAFE_NFD, { ...FAST, norm: 'raw' });
+  delete config.norm;                                  // as a pre-fix vault looks
+  const { norm } = await unlockVault(CAFE_NFD, config);
+  assert.equal(norm, 'raw', 'the raw form must be tried first, or legacy vaults get slower');
+});
+
+test('a pinned form is honoured exactly and not quietly widened', async () => {
+  // A vault pinned to NFKC must not also accept some other byte-form: pinning
+  // exists to make unlock deterministic, and silently falling back would make
+  // the recorded form meaningless.
+  const { config } = await createVaultConfig(CAFE_NFD, { ...FAST, norm: 'raw' });
+  config.norm = 'NFKC';                                // mislabel it
+  await assert.rejects(() => unlockVault(CAFE_NFD, config), WrongPassphraseError);
+});
+
+test('normalization never rescues an actually wrong passphrase', async () => {
+  const { config } = await createVaultConfig(CAFE_NFC, FAST);
+  await assert.rejects(() => unlockVault('cafe gratitude plan', config), WrongPassphraseError);
+  await assert.rejects(() => unlockVault('café gratitude plans', config), WrongPassphraseError);
+});
+
+test('an ASCII passphrase yields exactly one candidate — no wasted derivations', () => {
+  assert.equal(passphraseCandidates('plain ascii passphrase').length, 1);
+  assert.ok(passphraseCandidates(CAFE_NFD).length > 1);
+});
+
+test('candidates are deduplicated and start with the raw string', () => {
+  const c = passphraseCandidates(CAFE_NFD);
+  assert.equal(c[0].form, 'raw');
+  assert.equal(c[0].value, CAFE_NFD);
+  assert.equal(new Set(c.map((x) => x.value)).size, c.length, 'duplicate byte-forms would be derived twice');
+});
+
+test('normalizePassphrase leaves the string alone when no form is pinned', () => {
+  assert.equal(normalizePassphrase(CAFE_NFD, 'raw'), CAFE_NFD);
+  assert.equal(normalizePassphrase(CAFE_NFD, null), CAFE_NFD);
+  assert.equal(normalizePassphrase(CAFE_NFD, 'NFC'), CAFE_NFC);
+});
+
+test('normalization does not silently fold a passphrase into a weaker one', () => {
+  // NFKC maps compatibility characters, so a vault pinned to it treats these
+  // as the same passphrase. That is the documented trade for cross-platform
+  // agreement; this test exists so the behaviour is deliberate, not a surprise.
+  assert.equal(normalizePassphrase('ﬁnance', 'NFKC'), 'finance');
 });

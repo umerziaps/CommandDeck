@@ -99,6 +99,23 @@
   <!-- ============ vault view ============ -->
   <div id="vault-view" class="hidden">
 
+    <!-- the config document could not be READ (rules, network, offline).
+         Deliberately distinct from "no vault exists" — showing setup here
+         would invite overwriting a vault that is merely unreachable. -->
+    <section id="vault-error" class="vault-panel hidden">
+      <div class="vault-mark warn" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 4.5 2.8 20h18.4L12 4.5z"/><path d="M12 10.5v4"/><circle cx="12" cy="17.2" r=".9" fill="currentColor" stroke="none"/></svg>
+      </div>
+      <h2>Vault unreachable</h2>
+      <p class="vault-lede">
+        Your vault could not be read, so nothing is shown. This is not the same as
+        having no vault — do not create a new one, that would replace the key your
+        existing entries are encrypted under. Check the Firestore rules are published
+        and that you are online, then reload.
+      </p>
+      <p class="vault-error" id="ve-detail"></p>
+    </section>
+
     <!-- first run: choose a master passphrase -->
     <section id="vault-setup" class="vault-panel hidden">
       <div class="vault-mark" aria-hidden="true">
@@ -110,6 +127,7 @@
         stores nothing but ciphertext, so signing in to Google is not enough to read
         them — this passphrase is.
       </p>
+      <p class="vault-who" id="vs-who"></p>
       <div class="vault-form">
         <label class="vault-label" for="vs-pass">Master passphrase</label>
         <div class="secret-row">
@@ -139,6 +157,7 @@
       </div>
       <h2>Vault locked</h2>
       <p class="vault-lede" id="vl-lede">Enter your master passphrase to decrypt.</p>
+      <p class="vault-who" id="vl-who"></p>
       <div class="vault-form">
         <div class="secret-row">
           <input type="password" id="vl-pass" autocomplete="current-password" spellcheck="false" placeholder="Master passphrase" enterkeyhint="go">

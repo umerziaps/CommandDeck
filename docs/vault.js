@@ -64,6 +64,41 @@ export const MIN_PASSPHRASE = 10;
 // throw rather than return garbage — so this is a cheap, data-free probe.
 export const VERIFIER_PLAINTEXT = 'command-deck-vault-v1';
 
+/* ---------- Unicode normalization ---------- *
+ *
+ * PBKDF2 consumes bytes, not characters, and the same passphrase can be
+ * different bytes on different machines. "café" is five code points on macOS,
+ * which stores it decomposed (e + combining acute), and four on Windows and
+ * Linux, which compose it. Identical on screen, identical to the clipboard,
+ * different to TextEncoder — so the key derived on one machine does not
+ * decrypt what the other wrote, and the only symptom is "wrong passphrase".
+ *
+ * New vaults pin NFKC and record it, so there is nothing to guess. Vaults
+ * created before this existed have no recorded form, so unlock tries each
+ * candidate until one authenticates, then reports which worked so the caller
+ * can write it into the config and make the next unlock single-shot. The key
+ * itself never changes, so nothing has to be re-encrypted.
+ */
+export const DEFAULT_NORM = 'NFKC';
+const NORM_FORMS = ['NFC', 'NFD', 'NFKC', 'NFKD'];
+
+export function normalizePassphrase(pass, form) {
+  if (!form || form === 'raw') return pass;
+  return pass.normalize(form);
+}
+
+// Distinct byte-forms of this passphrase, in the order worth trying: the raw
+// string first, since that is what vaults predating this function used.
+export function passphraseCandidates(pass) {
+  const out = [{ form: 'raw', value: pass }];
+  for (const form of NORM_FORMS) {
+    let value;
+    try { value = pass.normalize(form); } catch (_) { continue; }
+    if (!out.some((c) => c.value === value)) out.push({ form, value });
+  }
+  return out;
+}
+
 export class WrongPassphraseError extends Error {
   constructor() { super('That passphrase does not unlock this vault.'); this.name = 'WrongPassphraseError'; }
 }
@@ -163,32 +198,49 @@ export async function decryptJson(key, blob, { aad = '', provider } = {}) {
 
 /* ---------- vault setup / unlock ---------- */
 
-export async function createVaultConfig(passphrase, { iterations = PBKDF2_ITERATIONS, provider, now } = {}) {
+export async function createVaultConfig(passphrase, { iterations = PBKDF2_ITERATIONS, provider, now, norm = DEFAULT_NORM } = {}) {
   const salt = newSalt(provider);
-  const key = await deriveKey(passphrase, salt, iterations, provider);
+  const key = await deriveKey(normalizePassphrase(passphrase, norm), salt, iterations, provider);
   const verifier = await encryptJson(key, VERIFIER_PLAINTEXT, { provider });
   return {
     key,
+    norm,
     config: {
       v: VAULT_VERSION,
       salt,
       iterations,
+      norm,
       verifier,
       createdAt: now || new Date().toISOString()
     }
   };
 }
 
-// Throws WrongPassphraseError on a bad passphrase, which is the only signal
-// the caller needs — no partial unlock, no "close enough".
+// Returns { key, norm }. `norm` is the byte-form that actually authenticated:
+// when the config did not record one, the caller should write it back so the
+// next unlock does one derivation instead of up to five.
+//
+// Throws WrongPassphraseError when no candidate authenticates. There is no
+// partial unlock and no "close enough".
 export async function unlockVault(passphrase, config, { provider } = {}) {
   if (!config?.salt) throw new Error('This vault has no configuration document.');
   const iterations = typeof config.iterations === 'number' && config.iterations > 0
     ? config.iterations : PBKDF2_ITERATIONS;
-  const key = await deriveKey(passphrase, config.salt, iterations, provider);
-  const probe = await decryptJson(key, config.verifier, { provider });
-  if (probe !== VERIFIER_PLAINTEXT) throw new WrongPassphraseError();
-  return key;
+
+  const candidates = config.norm
+    ? [{ form: config.norm, value: normalizePassphrase(passphrase, config.norm) }]
+    : passphraseCandidates(passphrase);
+
+  for (const { form, value } of candidates) {
+    const key = await deriveKey(value, config.salt, iterations, provider);
+    try {
+      const probe = await decryptJson(key, config.verifier, { provider });
+      if (probe === VERIFIER_PLAINTEXT) return { key, norm: form };
+    } catch (err) {
+      if (!(err instanceof WrongPassphraseError)) throw err;
+    }
+  }
+  throw new WrongPassphraseError();
 }
 
 /* ---------- entries ---------- */
