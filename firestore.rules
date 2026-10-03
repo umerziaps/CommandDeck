@@ -27,6 +27,17 @@ service cloud.firestore {
         allow create, update: if isOwner(userId) && validCategory();
       }
 
+      // ---- app releases ----
+      match /apps/{appId} {
+        allow read, delete: if isOwner(userId);
+        allow create, update: if isOwner(userId) && validApp();
+      }
+
+      match /releases/{releaseId} {
+        allow read, delete: if isOwner(userId);
+        allow create, update: if isOwner(userId) && validRelease();
+      }
+
       // ---- work timeline ----
       //
       // Plaintext, unlike the vault. These rules are therefore the ONLY thing
@@ -126,6 +137,33 @@ service cloud.firestore {
           // which is how every group is born. Requiring it would reject group
           // creation outright with a permission error.
           && (!d.keys().hasAny(['updatedAt']) || d.updatedAt is string);
+    }
+
+    function validApp() {
+      let d = request.resource.data;
+      return d.name is string && d.name.size() > 0 && d.name.size() <= 80
+          && d.platform is string
+          && d.repoUrl is string && d.artifactUrl is string
+          && d.notes is string && d.notes.size() <= 20000
+          && d.color is string && d.color.matches('^#[0-9A-Fa-f]{6}$')
+          && d.createdAt is string;
+    }
+
+    function validRelease() {
+      let d = request.resource.data;
+      return d.appId is string && d.appId.size() > 0
+          && d.version is string && d.version.size() <= 80
+          && d.build is string && d.build.size() <= 80
+          && d.env is string && d.env.size() <= 120
+          && d.changes is string && d.changes.size() <= 20000
+          && d.sourceUrl is string && d.artifactUrl is string
+          && d.buildDate is string && d.buildDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+          // The flag is a real boolean, so a truthy string cannot mark
+          // something as shipped, and a shipped release carries its date.
+          && d.production is bool
+          && (d.production == false ? d.prodDate == '' : d.prodDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$'))
+          && d.notes is string && d.notes.size() <= 20000
+          && d.createdAt is string && d.updatedAt is string;
     }
 
     function validEvent() {

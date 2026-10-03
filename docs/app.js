@@ -51,6 +51,12 @@ import {
   attachmentKind, monthLabel, dayLabel, todayDay, isDayString,
   RANGES, PROJECT_PALETTE, UNASSIGNED, MAX_ATTACHMENTS_PER_EVENT
 } from './timeline.js';
+import {
+  PLATFORMS, platformLabel, blankApp, normaliseApp, appBody, validateApp, appOrder, appById,
+  blankRelease, normaliseRelease, releaseBody, validateRelease, releaseLabel, releaseOrder,
+  filterReleases, environments, appSummary, locationKind, isOpenable, shortLocation,
+  parseBuildEmail, dedupeReleases, APP_PALETTE
+} from './releases.js';
 
 /* ------------------------------------------------------------------ *
  * SCHEMA — keep in lockstep with the Swift side (FirestoreItem.swift)
@@ -162,6 +168,14 @@ const state = {
   tlQuery: '',
   tlEditingId: null,
   tlDraftAtts: [],      // attachments staged in the open editor
+  apps: [],
+  releases: [],
+  rlApp: '',
+  rlEnv: '',
+  rlProdOnly: false,
+  rlQuery: '',
+  rlEditingId: null,
+  impParsed: [],
   expanded: {},
   collapsed: { __done__: true },
   pending: false,
@@ -172,6 +186,8 @@ let unsubItems = null;
 let unsubCats = null;
 let unsubEvents = null;
 let unsubProjects = null;
+let unsubApps = null;
+let unsubReleases = null;
 
 // The vault's own slice of state. `key` is a non-extractable CryptoKey and
 // lives nowhere else — not localStorage, not sessionStorage, not a cookie.
@@ -204,6 +220,11 @@ const catRef   = (id) => doc(db, 'users', state.user.uid, 'categories', id);
 const vaultCol = () => collection(db, 'users', state.user.uid, 'vault');
 const vaultRef = (id) => doc(db, 'users', state.user.uid, 'vault', id);
 const vaultCfgRef = () => doc(db, 'users', state.user.uid, 'vaultMeta', 'config');
+const appsCol = () => collection(db, 'users', state.user.uid, 'apps');
+const appRef = (id) => doc(db, 'users', state.user.uid, 'apps', id);
+const releasesCol = () => collection(db, 'users', state.user.uid, 'releases');
+const releaseRef = (id) => doc(db, 'users', state.user.uid, 'releases', id);
+
 const eventsCol = () => collection(db, 'users', state.user.uid, 'events');
 const eventRef = (id) => doc(db, 'users', state.user.uid, 'events', id);
 const projectsCol = () => collection(db, 'users', state.user.uid, 'projects');
@@ -246,6 +267,8 @@ onAuthStateChanged(auth, (user) => {
   if (unsubCats) { unsubCats(); unsubCats = null; }
   if (unsubEvents) { unsubEvents(); unsubEvents = null; }
   if (unsubProjects) { unsubProjects(); unsubProjects = null; }
+  if (unsubApps) { unsubApps(); unsubApps = null; }
+  if (unsubReleases) { unsubReleases(); unsubReleases = null; }
 
   $('boot').classList.add('hidden');
 
@@ -256,6 +279,7 @@ onAuthStateChanged(auth, (user) => {
 
   if (!user) {
     state.items = []; state.cats = []; state.events = []; state.projects = [];
+    state.apps = []; state.releases = [];
     $('app').classList.add('hidden');
     $('gate').classList.remove('hidden');
     return;
@@ -295,6 +319,19 @@ function subscribe() {
     state.projects = snap.docs.map((d) => normaliseProject(d.id, d.data())).sort(projectOrder);
     if (currentView === 'timeline') renderTimeline();
   }, (err) => console.error(err));
+
+  unsubApps = onSnapshot(appsCol(), (snap) => {
+    state.apps = snap.docs.map((d) => normaliseApp(d.id, d.data())).sort(appOrder);
+    if (currentView === 'releases') renderReleases();
+  }, (err) => console.error(err));
+
+  unsubReleases = onSnapshot(releasesCol(), (snap) => {
+    state.releases = snap.docs.map((d) => normaliseRelease(d.id, d.data()));
+    if (currentView === 'releases') renderReleases();
+  }, (err) => {
+    console.error(err);
+    toast('Could not read releases — check the Firestore rules');
+  });
 
   unsubCats = onSnapshot(catsCol(), (snap) => {
     state.cats = snap.docs
@@ -844,11 +881,13 @@ function setView(v) {
   $('board-view').classList.toggle('hidden', v !== 'board');
   $('vault-view').classList.toggle('hidden', v !== 'vault');
   $('timeline-view').classList.toggle('hidden', v !== 'timeline');
+  $('releases-view').classList.toggle('hidden', v !== 'releases');
   document.querySelectorAll('#view-tog button')
     .forEach((b) => b.classList.toggle('on', b.dataset.view === v));
 
   if (v === 'vault') { renderVault(); focusVault(); }
   else if (v === 'timeline') { renderTimeline(); $('tl-search').focus(); }
+  else if (v === 'releases') { renderReleases(); $('rl-search').focus(); }
   else $('cap-input').focus();
 }
 
@@ -1984,11 +2023,14 @@ document.addEventListener('keydown', (e) => {
     $('cat-ov').classList.remove('show');
     if ($('entry-ov').classList.contains('show')) closeEntry();
     if ($('ev-ov').classList.contains('show')) closeEvent();
+    if ($('rl-ov').classList.contains('show')) closeRelease();
+    $('imp-ov').classList.remove('show');
     $('group-ov').classList.remove('show');
   }
   if (e.key === '/' && !['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) {
     e.preventDefault();
-    const target = currentView === 'timeline' ? $('tl-search')
+    const target = currentView === 'releases' ? $('rl-search')
+      : currentView === 'timeline' ? $('tl-search')
       : (currentView === 'vault' && vault.key ? $('v-search') : $('cap-input'));
     target.focus();
   }
@@ -2450,3 +2492,377 @@ drop.addEventListener('drop', (e) => {
   const files = [...(e.dataTransfer?.files || [])];
   if (files.length) addFiles(files);
 });
+
+/* ================================================================== *
+ * RELEASES
+ *
+ * What shipped, which version, built for which environment, and whether it
+ * reached production. See docs/releases.js for the model and the build-email
+ * parser that fills it without retyping.
+ * ================================================================== */
+
+function renderReleases() {
+  renderAppBar();
+  renderEnvSelect();
+
+  const shown = filterReleases(state.releases, {
+    appId: state.rlApp, env: state.rlEnv, prodOnly: state.rlProdOnly, query: state.rlQuery
+  }).sort(releaseOrder);
+
+  renderSummary();
+
+  if (!shown.length) {
+    $('rl-list').innerHTML = `<div class="tl-empty">${
+      state.releases.length
+        ? 'Nothing matches those filters.'
+        : 'No releases recorded.<br>Paste a build email to backfill a whole thread at once.'
+    }</div>`;
+    return;
+  }
+
+  // Grouped by app when looking at everything; a flat run when one app is
+  // selected, because then the question is the sequence, not the grouping.
+  if (!state.rlApp && state.apps.length > 1) {
+    const byApp = new Map();
+    for (const r of shown) {
+      if (!byApp.has(r.appId)) byApp.set(r.appId, []);
+      byApp.get(r.appId).push(r);
+    }
+    $('rl-list').innerHTML = [...byApp.entries()].map(([appId, rs]) => {
+      const app = appById(state.apps, appId);
+      return `
+        <section class="rl-group">
+          <div class="tl-month-head">
+            <span class="v-dot" style="background:${esc(app ? app.color : 'var(--ink-3)')}"></span>
+            <span class="tl-month-name">${esc(app ? app.name : 'Unknown app')}</span>
+            <span class="tl-month-n">${rs.length} build${rs.length === 1 ? '' : 's'}</span>
+          </div>
+          ${rs.map(releaseHtml).join('')}
+        </section>`;
+    }).join('');
+  } else {
+    $('rl-list').innerHTML = shown.map(releaseHtml).join('');
+  }
+
+  $('rl-list').querySelectorAll('.rl-card').forEach((el) => el.addEventListener('click', (e) => {
+    if (e.target.closest('.loc')) return;
+    openRelease(el.dataset.id);
+  }));
+  $('rl-list').querySelectorAll('.loc').forEach((el) => el.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const v = el.dataset.value;
+    if (isOpenable(v)) window.open(v, '_blank', 'noopener');
+    else copyPlain(v, 'Path');
+  }));
+}
+
+function releaseHtml(r) {
+  const app = appById(state.apps, r.appId);
+  const loc = (label, value) => {
+    if (!value) return '';
+    const kind = locationKind(value);
+    // A UNC path is offered as "copy", not as a link. An anchor to \\fs04 from
+    // an https page is a control that silently does nothing.
+    return `
+      <button class="loc" data-value="${esc(value)}" title="${esc(value)}">
+        <span class="loc-k">${esc(label)}</span>
+        <span class="loc-v">${esc(shortLocation(value))}</span>
+        <span class="loc-a">${kind === 'url' ? 'open' : 'copy'}</span>
+      </button>`;
+  };
+
+  return `
+    <article class="rl-card" data-id="${esc(r.id)}">
+      <div class="rl-head">
+        <span class="rl-ver">${esc(releaseLabel(r))}</span>
+        ${r.env ? `<span class="rl-env-chip">${esc(r.env)}</span>` : ''}
+        ${r.production
+          ? `<span class="rl-prod">Production · ${esc(r.prodDate)}</span>`
+          : '<span class="rl-notprod">not in production</span>'}
+        <span class="rl-date">${esc(r.buildDate)}</span>
+      </div>
+      ${!state.rlApp && state.apps.length <= 1 && app ? `<div class="tl-proj">${esc(app.name)}</div>` : ''}
+      ${r.changes ? `<div class="rl-changes">${esc(r.changes)}</div>` : ''}
+      ${(r.sourceUrl || r.artifactUrl) ? `<div class="rl-locs">${loc('source', r.sourceUrl)}${loc('artifact', r.artifactUrl)}</div>` : ''}
+      ${r.notes ? `<div class="rl-notes">${esc(r.notes)}</div>` : ''}
+    </article>`;
+}
+
+function renderSummary() {
+  const box = $('rl-summary');
+  const apps = state.rlApp ? state.apps.filter((a) => a.id === state.rlApp) : state.apps;
+  if (!apps.length) { box.innerHTML = ''; return; }
+
+  box.innerHTML = apps.map((a) => {
+    const s = appSummary(state.releases, a.id);
+    if (!s.total) return '';
+    return `
+      <div class="rl-stat">
+        <div class="rl-stat-app"><span class="v-dot" style="background:${esc(a.color)}"></span>${esc(a.name)}
+          <span class="rl-plat-tag">${esc(platformLabel(a.platform))}</span></div>
+        <div class="rl-stat-row">
+          <span><span class="k">latest</span> ${esc(s.latest ? releaseLabel(s.latest) : '—')}</span>
+          <span><span class="k">in production</span> ${s.production ? `${esc(releaseLabel(s.production))} · ${esc(s.production.prodDate)}` : 'none'}</span>
+          <span><span class="k">built since</span> ${s.sinceProduction}</span>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function renderAppBar() {
+  const bar = $('rl-app-bar');
+  if (!state.apps.length) { bar.innerHTML = ''; return; }
+  const chip = (id, label, color, n) => `
+    <button class="group-chip${state.rlApp === id ? ' on' : ''}" data-app="${esc(id)}">
+      ${color ? `<span class="v-dot" style="background:${esc(color)}"></span>` : ''}
+      ${esc(label)}<span class="group-chip-n">${n}</span>
+    </button>`;
+  bar.innerHTML = chip('', 'All', '', state.releases.length)
+    + state.apps.map((a) => chip(a.id, a.name, a.color, state.releases.filter((r) => r.appId === a.id).length)).join('');
+  bar.querySelectorAll('[data-app]').forEach((b) => b.addEventListener('click', () => {
+    state.rlApp = b.dataset.app;
+    renderReleases();
+  }));
+}
+
+function renderEnvSelect() {
+  const sel = $('rl-env');
+  const envs = environments(state.releases);
+  const want = `<option value="">All environments</option>${envs.map((e) => `<option>${esc(e)}</option>`).join('')}`;
+  if (sel.innerHTML !== want) sel.innerHTML = want;
+  sel.value = state.rlEnv;
+  $('rl-env-list').innerHTML = envs.map((e) => `<option value="${esc(e)}">`).join('');
+}
+
+async function copyPlain(text, label) {
+  try { await navigator.clipboard.writeText(text); toast(`${label} copied`, true); }
+  catch (_) { toast('This browser blocked the clipboard'); }
+}
+
+/* ---------- editor ---------- */
+
+function fillAppSelect(selectId, selected) {
+  const sel = $(selectId);
+  sel.innerHTML = state.apps.map((a) => `<option value="${esc(a.id)}">${esc(a.name)}</option>`).join('')
+    || '<option value="">No apps yet</option>';
+  if (selected && state.apps.some((a) => a.id === selected)) sel.value = selected;
+}
+
+function openRelease(id) {
+  const r = id ? state.releases.find((x) => x.id === id) : null;
+  const src = r || blankRelease(state.rlApp || state.apps[0]?.id || '', todayDay());
+  state.rlEditingId = r ? id : null;
+
+  $('rl-heading').textContent = r ? `Edit ${releaseLabel(r)}` : 'New release';
+  fillAppSelect('rl-app', src.appId);
+  $('rl-date').value = isDayString(src.buildDate) ? src.buildDate : todayDay();
+  $('rl-version').value = src.version || '';
+  $('rl-build').value = src.build || '';
+  $('rl-envf').value = src.env || '';
+  $('rl-changes').value = src.changes || '';
+  $('rl-source').value = src.sourceUrl || '';
+  $('rl-artifact').value = src.artifactUrl || '';
+  $('rl-notes').value = src.notes || '';
+  $('rl-production').checked = !!src.production;
+  $('rl-prod-date').value = src.prodDate || '';
+  syncProdDate();
+  $('rl-error').textContent = '';
+  $('rl-delete').classList.toggle('hidden', !r);
+  showInlineApp(false);
+  renderEnvSelect();
+
+  $('rl-ov').classList.add('show');
+  $('rl-version').focus();
+}
+
+// Ticking "pushed to production" has to ask when. A flag with no date cannot
+// answer the question the flag exists for.
+function syncProdDate() {
+  const on = $('rl-production').checked;
+  $('rl-prod-date').classList.toggle('hidden', !on);
+  if (on && !$('rl-prod-date').value) $('rl-prod-date').value = todayDay();
+}
+
+function closeRelease() {
+  $('rl-ov').classList.remove('show');
+  state.rlEditingId = null;
+  ['rl-version', 'rl-build', 'rl-envf', 'rl-changes', 'rl-source', 'rl-artifact', 'rl-notes', 'rl-app-name']
+    .forEach((id) => { $(id).value = ''; });
+  $('rl-production').checked = false;
+  showInlineApp(false);
+}
+
+async function saveRelease() {
+  const r = {
+    appId: $('rl-app').value || '',
+    version: $('rl-version').value.trim(),
+    build: $('rl-build').value.trim(),
+    env: $('rl-envf').value.trim(),
+    changes: $('rl-changes').value,
+    sourceUrl: $('rl-source').value.trim(),
+    artifactUrl: $('rl-artifact').value.trim(),
+    buildDate: $('rl-date').value,
+    production: $('rl-production').checked,
+    prodDate: $('rl-prod-date').value,
+    notes: $('rl-notes').value
+  };
+
+  const check = validateRelease(r);
+  if (!check.ok) { $('rl-error').textContent = check.error; return; }
+
+  const id = state.rlEditingId || uid('rl');
+  const now = new Date().toISOString();
+  const existing = state.releases.find((x) => x.id === id);
+  try {
+    await setDoc(releaseRef(id), {
+      ...releaseBody(r),
+      createdAt: existing?.createdAt || now,
+      updatedAt: now
+    });
+    closeRelease();
+    toast(existing ? 'Release saved' : 'Release recorded', true);
+  } catch (err) {
+    console.error(err);
+    $('rl-error').textContent = `Could not save: ${err?.message || err}`;
+  }
+}
+
+async function deleteRelease(id) {
+  const r = state.releases.find((x) => x.id === id);
+  const ok = await askConfirm(`${releaseLabel(r || {})} will be deleted. There is no undo.`, 'Delete release?');
+  if (!ok) return;
+  try { await deleteDoc(releaseRef(id)); closeRelease(); toast('Deleted', true); }
+  catch (err) { console.error(err); toast('Could not delete'); }
+}
+
+/* ---------- apps ---------- */
+
+function showInlineApp(show) {
+  $('rl-app-new-row').classList.toggle('hidden', !show);
+  if (show) {
+    $('rl-app-platform').innerHTML = PLATFORMS.map((p) => `<option value="${p.key}">${esc(p.label)}</option>`).join('');
+    $('rl-app-name').value = '';
+    $('rl-app-name').focus();
+  }
+}
+
+async function createAppInline(targetSelect = 'rl-app') {
+  const app = { ...blankApp(state.apps.length), name: $('rl-app-name').value.trim(), platform: $('rl-app-platform').value };
+  const check = validateApp(app, state.apps);
+  if (!check.ok) { $('rl-error').textContent = check.error; return null; }
+
+  const id = uid('app');
+  try {
+    await setDoc(appRef(id), { ...appBody(app), createdAt: new Date().toISOString() });
+    $('rl-error').textContent = '';
+    showInlineApp(false);
+    fillAppSelect(targetSelect, id);
+    setTimeout(() => fillAppSelect(targetSelect, id), 400);
+    return id;
+  } catch (err) {
+    console.error(err);
+    $('rl-error').textContent = `Could not create the app: ${err?.message || err}`;
+    return null;
+  }
+}
+
+/* ---------- import from a build email ---------- */
+
+function openImport() {
+  $('imp-text').value = '';
+  $('imp-status').textContent = '';
+  $('imp-error').textContent = '';
+  $('imp-preview').innerHTML = '';
+  $('imp-save').disabled = true;
+  state.impParsed = [];
+  fillAppSelect('imp-app', state.rlApp || state.apps[0]?.id || '');
+  $('imp-ov').classList.add('show');
+  setTimeout(() => $('imp-text').focus(), 30);
+}
+
+function previewImport() {
+  const appId = $('imp-app').value;
+  if (!appId) { $('imp-error').textContent = 'Create an app first — a release has to belong to something.'; return; }
+
+  const res = parseBuildEmail($('imp-text').value, { defaultDate: todayDay() });
+  if (!res.ok) {
+    $('imp-error').textContent = res.error;
+    $('imp-preview').innerHTML = '';
+    $('imp-save').disabled = true;
+    return;
+  }
+
+  const { fresh, skipped } = dedupeReleases(res.releases, state.releases, appId);
+  state.impParsed = fresh.map((r) => ({ ...r, appId }));
+  $('imp-error').textContent = '';
+  $('imp-save').disabled = !fresh.length;
+  $('imp-status').textContent =
+    `${res.releases.length} found · ${fresh.length} new${skipped ? ` · ${skipped} already recorded` : ''}`;
+
+  $('imp-preview').innerHTML = fresh.length
+    ? fresh.map((r) => `
+        <div class="imp-row">
+          <span class="imp-ver">${esc(releaseLabel(r))}</span>
+          <span class="imp-env">${esc(r.env || '—')}</span>
+          <span class="imp-date">${esc(r.buildDate || 'no date')}</span>
+          <span class="imp-chg">${esc((r.changes || '').split('\n')[0].slice(0, 60))}</span>
+        </div>`).join('')
+    : '<div class="imp-row quiet">Everything in that email is already recorded.</div>';
+}
+
+async function runImport() {
+  if (!state.impParsed.length) return;
+  $('imp-save').disabled = true;
+  const now = new Date().toISOString();
+  let done = 0;
+
+  try {
+    // Chunked: Firestore caps a batch at 500 writes, and a backfilled thread
+    // can be long.
+    for (let i = 0; i < state.impParsed.length; i += 400) {
+      const batch = writeBatch(db);
+      for (const r of state.impParsed.slice(i, i + 400)) {
+        batch.set(releaseRef(uid('rl')), { ...releaseBody(r), createdAt: now, updatedAt: now });
+        done++;
+      }
+      await batch.commit();
+    }
+    $('imp-ov').classList.remove('show');
+    toast(`Imported ${done} release${done === 1 ? '' : 's'}`, true);
+  } catch (err) {
+    console.error(err);
+    $('imp-error').textContent = `Import failed after ${done}: ${err?.message || err}`;
+    $('imp-save').disabled = false;
+  }
+}
+
+/* ---------- releases wiring ---------- */
+
+$('rl-new').addEventListener('click', () => openRelease(null));
+$('rl-search').addEventListener('input', () => { state.rlQuery = $('rl-search').value; renderReleases(); });
+$('rl-env').addEventListener('change', () => { state.rlEnv = $('rl-env').value; renderReleases(); });
+$('rl-prod-only').addEventListener('change', () => { state.rlProdOnly = $('rl-prod-only').checked; renderReleases(); });
+
+$('rl-x').addEventListener('click', closeRelease);
+$('rl-cancel').addEventListener('click', closeRelease);
+$('rl-save').addEventListener('click', saveRelease);
+$('rl-delete').addEventListener('click', () => { if (state.rlEditingId) deleteRelease(state.rlEditingId); });
+$('rl-ov').addEventListener('click', (e) => { if (e.target.id === 'rl-ov') closeRelease(); });
+$('rl-production').addEventListener('change', syncProdDate);
+
+$('rl-app-new').addEventListener('click', () => showInlineApp(true));
+$('rl-app-cancel').addEventListener('click', () => showInlineApp(false));
+$('rl-app-save').addEventListener('click', () => createAppInline('rl-app'));
+$('rl-app-name').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); createAppInline('rl-app'); }
+  if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); showInlineApp(false); }
+});
+
+$('rl-import').addEventListener('click', openImport);
+$('imp-x').addEventListener('click', () => $('imp-ov').classList.remove('show'));
+$('imp-cancel').addEventListener('click', () => $('imp-ov').classList.remove('show'));
+$('imp-ov').addEventListener('click', (e) => { if (e.target.id === 'imp-ov') $('imp-ov').classList.remove('show'); });
+$('imp-parse').addEventListener('click', previewImport);
+$('imp-text').addEventListener('input', () => { $('imp-save').disabled = true; $('imp-status').textContent = ''; });
+$('imp-app').addEventListener('change', () => { if ($('imp-text').value.trim()) previewImport(); });
+$('imp-save').addEventListener('click', runImport);

@@ -726,3 +726,81 @@ html[data-theme="light"]{ --chart:#12A886; --chart-soft:rgba(18,168,134,.18); }
   .range-tog button{padding:8px 8px; font-size:12px;}
   .tl-strip{height:56px;}
 }
+
+/* ---------- releases ---------- */
+.rl-env, .rl-plat{
+  background:var(--card); border:1px solid var(--line-strong); border-radius:11px;
+  padding:10px 12px; color:var(--ink); font-size:13px; font-family:var(--font-body);
+}
+.rl-env:focus, .rl-plat:focus{outline:none; border-color:var(--accent);}
+.prod-only{white-space:nowrap;}
+
+.rl-summary{display:flex; flex-direction:column; gap:8px; margin-bottom:16px;}
+.rl-stat{background:var(--card); border:1px solid var(--line); border-radius:12px; padding:11px 14px;}
+.rl-stat-app{display:flex; align-items:center; gap:8px; font-size:13.5px; font-weight:600; margin-bottom:7px;}
+.rl-plat-tag{
+  font-size:10px; font-weight:700; letter-spacing:.05em; text-transform:uppercase;
+  color:var(--ink-3); background:var(--card-2); border-radius:5px; padding:2px 6px;
+}
+.rl-stat-row{display:flex; gap:20px; flex-wrap:wrap; font-size:12.5px; color:var(--ink-2);}
+.rl-stat-row .k{color:var(--ink-3); font-size:10.5px; text-transform:uppercase; letter-spacing:.05em; margin-right:5px;}
+
+.rl-list{display:flex; flex-direction:column; gap:9px;}
+.rl-group{margin-bottom:18px;}
+.rl-group .rl-card{margin-bottom:9px;}
+.rl-card{
+  background:var(--card); border:1px solid var(--line); border-radius:12px;
+  padding:12px 14px; cursor:pointer;
+}
+.rl-card:hover{border-color:var(--line-strong);}
+.rl-head{display:flex; align-items:center; gap:9px; flex-wrap:wrap;}
+.rl-ver{font-family:var(--font-mono); font-size:14px; font-weight:600; letter-spacing:-.01em;}
+.rl-env-chip{
+  font-size:11px; font-weight:600; color:var(--ink-2); background:var(--card-2);
+  border:1px solid var(--line); border-radius:6px; padding:2px 7px;
+}
+/* Shipped is a state, so it gets a word as well as a colour. */
+.rl-prod{
+  font-size:11px; font-weight:700; color:var(--accent-ink); background:var(--accent);
+  border-radius:6px; padding:3px 8px;
+}
+.rl-notprod{font-size:11px; color:var(--ink-3);}
+.rl-date{margin-left:auto; font-family:var(--font-mono); font-size:11.5px; color:var(--ink-3);}
+.rl-changes{font-size:13px; color:var(--ink-2); line-height:1.55; margin-top:8px; white-space:pre-wrap;}
+.rl-notes{font-size:11.5px; color:var(--ink-3); line-height:1.5; margin-top:8px; white-space:pre-wrap;}
+
+.rl-locs{display:flex; gap:7px; flex-wrap:wrap; margin-top:10px;}
+.loc{
+  display:inline-flex; align-items:center; gap:7px; max-width:100%;
+  background:var(--card-2); border:1px solid var(--line); border-radius:8px;
+  padding:5px 9px; font-size:11.5px; color:var(--ink-2); cursor:pointer;
+}
+.loc:hover{border-color:var(--accent); color:var(--accent);}
+.loc-k{font-size:10px; text-transform:uppercase; letter-spacing:.05em; color:var(--ink-3); flex-shrink:0;}
+.loc-v{font-family:var(--font-mono); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.loc-a{
+  font-size:9.5px; font-weight:700; text-transform:uppercase; letter-spacing:.05em;
+  color:var(--ink-3); border:1px solid var(--line); border-radius:4px; padding:1px 4px; flex-shrink:0;
+}
+.loc:hover .loc-a{color:var(--accent); border-color:var(--accent);}
+
+.prod-row{display:flex; align-items:center; gap:11px; margin-top:6px; flex-wrap:wrap;}
+.prod-row input[type=date]{max-width:180px;}
+
+.imp-actions{display:flex; align-items:center; gap:11px; margin-top:8px;}
+.imp-preview{display:flex; flex-direction:column; gap:3px; max-height:220px; overflow:auto; margin-top:10px;}
+.imp-row{
+  display:flex; gap:11px; align-items:baseline; font-size:12px;
+  padding:6px 9px; background:var(--card-2); border-radius:7px;
+}
+.imp-row.quiet{color:var(--ink-3); justify-content:center;}
+.imp-ver{font-family:var(--font-mono); font-weight:600; min-width:110px; flex-shrink:0;}
+.imp-env{color:var(--ink-2); min-width:78px; flex-shrink:0;}
+.imp-date{font-family:var(--font-mono); color:var(--ink-3); min-width:84px; flex-shrink:0;}
+.imp-chg{color:var(--ink-3); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+
+@media (max-width:560px){
+  .rl-stat-row{gap:11px;}
+  .rl-date{margin-left:0;}
+  .imp-row{flex-wrap:wrap; gap:6px;}
+}

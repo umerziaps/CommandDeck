@@ -64,6 +64,7 @@
           <svg class="lock-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
         </button>
         <button data-view="timeline">Timeline</button>
+        <button data-view="releases">Releases</button>
       </div>
       <div class="theme-tog" id="theme-tog">
         <button data-theme-set="light" title="Light" aria-label="Light theme">
@@ -217,6 +218,24 @@
 
     <div id="tl-list" class="tl-list"></div>
   </div><!-- /timeline-view -->
+
+  <!-- ============ releases view ============ -->
+  <div id="releases-view" class="hidden">
+    <div class="tl-bar">
+      <div class="tl-search">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+        <input type="search" id="rl-search" placeholder="Search versions, changes…" autocomplete="off">
+      </div>
+      <select id="rl-env" class="rl-env" aria-label="Environment"></select>
+      <label class="gen-opt prod-only"><input type="checkbox" id="rl-prod-only"><span>Production only</span></label>
+      <button class="btn-quiet compact" id="rl-import">Paste build email</button>
+      <button class="btn-primary compact" id="rl-new">New release</button>
+    </div>
+
+    <div class="proj-bar" id="rl-app-bar"></div>
+    <div id="rl-summary" class="rl-summary"></div>
+    <div id="rl-list" class="rl-list"></div>
+  </div><!-- /releases-view -->
 </div>
 
 <!-- ============ menu sheet ============ -->
@@ -345,6 +364,116 @@
         <div class="spacer"></div>
         <button class="btn-quiet" id="e-cancel">Cancel</button>
         <button class="btn-primary" id="e-save">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ release editor ============ -->
+<div class="ov" id="rl-ov">
+  <div class="sheet wide">
+    <div class="sheet-head">
+      <h3 id="rl-heading">New release</h3>
+      <button class="sheet-x" id="rl-x" aria-label="Close">✕</button>
+    </div>
+
+    <div class="entry-form">
+      <div class="ev-row">
+        <div class="ev-col">
+          <label class="vault-label" for="rl-app">App</label>
+          <div class="group-pick-row">
+            <select id="rl-app"></select>
+            <button class="btn-quiet compact" id="rl-app-new" type="button">New</button>
+          </div>
+        </div>
+        <div class="ev-col">
+          <label class="vault-label" for="rl-date">Build date</label>
+          <input type="date" id="rl-date">
+        </div>
+      </div>
+      <div class="group-new-row hidden" id="rl-app-new-row">
+        <input type="text" id="rl-app-name" placeholder="Ocufii Android" autocomplete="off" maxlength="80">
+        <select id="rl-app-platform" class="rl-plat"></select>
+        <button class="btn-primary compact" id="rl-app-save" type="button">Create</button>
+        <button class="btn-quiet compact" id="rl-app-cancel" type="button">Cancel</button>
+      </div>
+
+      <div class="ev-row">
+        <div class="ev-col">
+          <label class="vault-label" for="rl-version">Version</label>
+          <input type="text" id="rl-version" placeholder="v1.3.2" autocomplete="off">
+        </div>
+        <div class="ev-col">
+          <label class="vault-label" for="rl-build">Build</label>
+          <input type="text" id="rl-build" placeholder="189" autocomplete="off">
+        </div>
+        <div class="ev-col">
+          <label class="vault-label" for="rl-envf">Environment / flavour</label>
+          <input type="text" id="rl-envf" placeholder="California" autocomplete="off" list="rl-env-list">
+          <datalist id="rl-env-list"></datalist>
+        </div>
+      </div>
+
+      <label class="vault-label" for="rl-changes">Changes</label>
+      <textarea id="rl-changes" rows="6" placeholder="What is in this build."></textarea>
+
+      <label class="vault-label" for="rl-source">Source code location</label>
+      <input type="text" id="rl-source" placeholder="https://github.com/… or \\fs04\…" autocomplete="off" spellcheck="false">
+
+      <label class="vault-label" for="rl-artifact">Artifact location</label>
+      <input type="text" id="rl-artifact" placeholder="Where the APK / AAB / bundle landed" autocomplete="off" spellcheck="false">
+
+      <div class="prod-row">
+        <label class="gen-opt"><input type="checkbox" id="rl-production"><span>Pushed to production</span></label>
+        <input type="date" id="rl-prod-date" class="hidden" aria-label="Date it went to production">
+      </div>
+
+      <label class="vault-label" for="rl-notes">Notes</label>
+      <textarea id="rl-notes" rows="3" placeholder="SDK levels, signing, anything else worth keeping."></textarea>
+
+      <p class="vault-error" id="rl-error"></p>
+      <div class="entry-actions">
+        <button class="btn-danger ghost" id="rl-delete">Delete</button>
+        <div class="spacer"></div>
+        <button class="btn-quiet" id="rl-cancel">Cancel</button>
+        <button class="btn-primary" id="rl-save">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ import from a build email ============ -->
+<div class="ov" id="imp-ov">
+  <div class="sheet wide">
+    <div class="sheet-head">
+      <h3>Paste a build email</h3>
+      <button class="sheet-x" id="imp-x" aria-label="Close">✕</button>
+    </div>
+    <div class="entry-form">
+      <p class="vault-lede" style="text-align:left;margin-bottom:12px">
+        Paste the whole email, replies and all. Every build announcement in the thread is read,
+        so the first paste backfills the history and later ones add just the new build.
+        Anything already recorded is skipped.
+      </p>
+
+      <label class="vault-label" for="imp-app">Into which app</label>
+      <select id="imp-app"></select>
+
+      <label class="vault-label" for="imp-text">The email</label>
+      <textarea id="imp-text" rows="9" spellcheck="false" placeholder="BUILD DETAILS&#10;Release: v1.3.2 (189)&#10;Environment: (California)&#10;…"></textarea>
+
+      <div class="imp-actions">
+        <button class="btn-quiet compact" id="imp-parse">Read it</button>
+        <span class="att-hint" id="imp-status"></span>
+      </div>
+
+      <div id="imp-preview" class="imp-preview"></div>
+      <p class="vault-error" id="imp-error"></p>
+
+      <div class="entry-actions">
+        <div class="spacer"></div>
+        <button class="btn-quiet" id="imp-cancel">Cancel</button>
+        <button class="btn-primary" id="imp-save" disabled>Import</button>
       </div>
     </div>
   </div>
