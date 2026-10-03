@@ -19,6 +19,11 @@ import {
   collection, doc, getDoc, setDoc, updateDoc, deleteDoc, onSnapshot, writeBatch, getDocs
 } from 'https://www.gstatic.com/firebasejs/12.17.1/firebase-firestore.js';
 
+import {
+  getStorage, ref as storageRef, uploadBytesResumable,
+  getDownloadURL, deleteObject
+} from 'https://www.gstatic.com/firebasejs/12.17.1/firebase-storage.js';
+
 import { firebaseConfig } from './firebase-config.js';
 import {
   BUCKETS, CAT_PALETTE, nextColor, uid, esc,
@@ -38,6 +43,14 @@ import {
   genPassword, passwordStrength, maskSecret, hasSmartPunctuation,
   WrongPassphraseError, VAULT_VERSION
 } from './vault.js';
+import {
+  blankEvent, normaliseEvent, eventBody, eventOrder, validateEvent,
+  filterEvents, groupByMonth, monthlyDensity, countByProject,
+  blankProject, normaliseProject, validateProject, projectOrder, projectById,
+  attachmentPath, validateAttachment, normaliseAttachment, formatBytes,
+  attachmentKind, monthLabel, dayLabel, todayDay, isDayString,
+  RANGES, PROJECT_PALETTE, UNASSIGNED, MAX_ATTACHMENTS_PER_EVENT
+} from './timeline.js';
 
 /* ------------------------------------------------------------------ *
  * SCHEMA — keep in lockstep with the Swift side (FirestoreItem.swift)
@@ -121,6 +134,20 @@ try {
   db = getFirestore(app);
 }
 
+// Created lazily. A project with no Cloud Storage bucket provisioned throws
+// here, and that must not stop the board and the vault from loading — the
+// timeline degrades to events without attachments instead.
+let storage = null;
+let storageError = null;
+function getStore() {
+  if (storage || storageError) return storage;
+  try { storage = getStorage(app); } catch (err) {
+    storageError = err?.message || String(err);
+    console.warn('Cloud Storage unavailable:', storageError);
+  }
+  return storage;
+}
+
 /* ---------- state ---------- */
 
 const state = {
@@ -128,6 +155,13 @@ const state = {
   items: [],
   cats: [],
   catFilter: '',
+  events: [],
+  projects: [],
+  tlRange: '6m',
+  tlProject: '',
+  tlQuery: '',
+  tlEditingId: null,
+  tlDraftAtts: [],      // attachments staged in the open editor
   expanded: {},
   collapsed: { __done__: true },
   pending: false,
@@ -136,6 +170,8 @@ const state = {
 
 let unsubItems = null;
 let unsubCats = null;
+let unsubEvents = null;
+let unsubProjects = null;
 
 // The vault's own slice of state. `key` is a non-extractable CryptoKey and
 // lives nowhere else — not localStorage, not sessionStorage, not a cookie.
@@ -168,6 +204,11 @@ const catRef   = (id) => doc(db, 'users', state.user.uid, 'categories', id);
 const vaultCol = () => collection(db, 'users', state.user.uid, 'vault');
 const vaultRef = (id) => doc(db, 'users', state.user.uid, 'vault', id);
 const vaultCfgRef = () => doc(db, 'users', state.user.uid, 'vaultMeta', 'config');
+const eventsCol = () => collection(db, 'users', state.user.uid, 'events');
+const eventRef = (id) => doc(db, 'users', state.user.uid, 'events', id);
+const projectsCol = () => collection(db, 'users', state.user.uid, 'projects');
+const projectRef = (id) => doc(db, 'users', state.user.uid, 'projects', id);
+
 const groupsCol = () => collection(db, 'users', state.user.uid, 'vaultGroups');
 const groupRef = (id) => doc(db, 'users', state.user.uid, 'vaultGroups', id);
 const catOf    = (id) => state.cats.find((c) => c.id === id) || null;
@@ -203,6 +244,8 @@ onAuthStateChanged(auth, (user) => {
 
   if (unsubItems) { unsubItems(); unsubItems = null; }
   if (unsubCats) { unsubCats(); unsubCats = null; }
+  if (unsubEvents) { unsubEvents(); unsubEvents = null; }
+  if (unsubProjects) { unsubProjects(); unsubProjects = null; }
 
   $('boot').classList.add('hidden');
 
@@ -212,7 +255,7 @@ onAuthStateChanged(auth, (user) => {
   vault.config = null;
 
   if (!user) {
-    state.items = []; state.cats = [];
+    state.items = []; state.cats = []; state.events = []; state.projects = [];
     $('app').classList.add('hidden');
     $('gate').classList.remove('hidden');
     return;
@@ -239,6 +282,19 @@ function subscribe() {
     toast('Could not read your board — check the Firestore rules');
     console.error(err);
   });
+
+  unsubEvents = onSnapshot(eventsCol(), (snap) => {
+    state.events = snap.docs.map((d) => normaliseEvent(d.id, d.data()));
+    if (currentView === 'timeline') renderTimeline();
+  }, (err) => {
+    console.error(err);
+    toast('Could not read the timeline — check the Firestore rules');
+  });
+
+  unsubProjects = onSnapshot(projectsCol(), (snap) => {
+    state.projects = snap.docs.map((d) => normaliseProject(d.id, d.data())).sort(projectOrder);
+    if (currentView === 'timeline') renderTimeline();
+  }, (err) => console.error(err));
 
   unsubCats = onSnapshot(catsCol(), (snap) => {
     state.cats = snap.docs
@@ -787,10 +843,12 @@ function setView(v) {
   currentView = v;
   $('board-view').classList.toggle('hidden', v !== 'board');
   $('vault-view').classList.toggle('hidden', v !== 'vault');
+  $('timeline-view').classList.toggle('hidden', v !== 'timeline');
   document.querySelectorAll('#view-tog button')
     .forEach((b) => b.classList.toggle('on', b.dataset.view === v));
 
   if (v === 'vault') { renderVault(); focusVault(); }
+  else if (v === 'timeline') { renderTimeline(); $('tl-search').focus(); }
   else $('cap-input').focus();
 }
 
@@ -1925,11 +1983,14 @@ document.addEventListener('keydown', (e) => {
     $('menu-ov').classList.remove('show');
     $('cat-ov').classList.remove('show');
     if ($('entry-ov').classList.contains('show')) closeEntry();
+    if ($('ev-ov').classList.contains('show')) closeEvent();
     $('group-ov').classList.remove('show');
   }
   if (e.key === '/' && !['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) {
     e.preventDefault();
-    (currentView === 'vault' && vault.key ? $('v-search') : $('cap-input')).focus();
+    const target = currentView === 'timeline' ? $('tl-search')
+      : (currentView === 'vault' && vault.key ? $('v-search') : $('cap-input'));
+    target.focus();
   }
   // Cmd/Ctrl-L locks the vault from anywhere, the way a screen lock should be
   // reachable without hunting for a button.
@@ -1942,3 +2003,450 @@ document.addEventListener('keydown', (e) => {
 
 // Re-render at midnight so "today" / "tomorrow" labels stay honest.
 setInterval(() => { if (state.user) render(); }, 60_000);
+
+/* ================================================================== *
+ * TIMELINE
+ *
+ * A record of what happened at work and when, so that six months later the
+ * shape of a period can be seen rather than reconstructed. Plaintext by
+ * choice — see docs/timeline.js for what that costs.
+ * ================================================================== */
+
+/* ---------- render ---------- */
+
+function renderTimeline() {
+  const today = todayDay();
+  const inRange = filterEvents(state.events, {
+    rangeKey: state.tlRange, projectId: '', query: state.tlQuery, today
+  });
+  const shown = filterEvents(state.events, {
+    rangeKey: state.tlRange, projectId: state.tlProject, query: state.tlQuery, today
+  });
+
+  renderRangeTog();
+  renderProjectBar(inRange);
+  renderStrip(shown, today);
+
+  if (!shown.length) {
+    $('tl-list').innerHTML = `<div class="tl-empty">${
+      state.events.length
+        ? 'Nothing in this window.<br>Widen the range, or clear the filters.'
+        : 'No events yet.<br>Record what happened — a spec handed over, a release published, an incident — and it will still make sense in a year.'
+    }</div>`;
+    return;
+  }
+
+  $('tl-list').innerHTML = groupByMonth(shown).map((m) => `
+    <section class="tl-month">
+      <div class="tl-month-head">
+        <span class="tl-month-name">${esc(m.label)}</span>
+        <span class="tl-month-n">${m.events.length} event${m.events.length === 1 ? '' : 's'}</span>
+      </div>
+      ${m.events.map(eventHtml).join('')}
+    </section>`).join('');
+
+  $('tl-list').querySelectorAll('.tl-body').forEach((el) =>
+    el.addEventListener('click', (e) => {
+      if (e.target.closest('.att-chip')) return;   // the chip opens the file
+      openEvent(el.dataset.id);
+    }));
+
+  $('tl-list').querySelectorAll('.att-chip').forEach((chip) =>
+    chip.addEventListener('click', (e) => { e.stopPropagation(); openAttachment(chip.dataset.path, chip.dataset.name); }));
+}
+
+function renderRangeTog() {
+  const bar = $('tl-range');
+  if (bar.childElementCount !== RANGES.length) {
+    bar.innerHTML = RANGES.map((r) =>
+      `<button data-range="${r.key}">${esc(r.key === 'all' ? 'All' : r.key)}</button>`).join('');
+    bar.querySelectorAll('button').forEach((b) => b.addEventListener('click', () => {
+      state.tlRange = b.dataset.range;
+      renderTimeline();
+    }));
+  }
+  bar.querySelectorAll('button').forEach((b) =>
+    b.classList.toggle('on', b.dataset.range === state.tlRange));
+}
+
+function renderProjectBar(scope) {
+  const bar = $('tl-proj-bar');
+  if (!state.projects.length) { bar.innerHTML = ''; return; }
+
+  const counts = countByProject(scope, state.projects);
+  const chip = (id, label, color, n) => `
+    <button class="group-chip${state.tlProject === id ? ' on' : ''}" data-proj="${esc(id)}">
+      ${color ? `<span class="v-dot" style="background:${esc(color)}"></span>` : ''}
+      ${esc(label)}<span class="group-chip-n">${n}</span>
+    </button>`;
+
+  bar.innerHTML = chip('', 'All', '', scope.length)
+    + state.projects.map((p) => chip(p.id, p.name, p.color, counts[p.id] || 0)).join('')
+    + (counts[UNASSIGNED] ? chip(UNASSIGNED, 'Unassigned', '', counts[UNASSIGNED]) : '');
+
+  bar.querySelectorAll('[data-proj]').forEach((b) => b.addEventListener('click', () => {
+    state.tlProject = b.dataset.proj;
+    renderTimeline();
+  }));
+}
+
+/**
+ * The density strip.
+ *
+ * One series, so no legend — the caption says what is plotted. No value on
+ * every bar either: the peak is called out in the subtitle and every single
+ * count is readable in the month headings below, which is the table view this
+ * chart is allowed to lean on. Hovering gives the rest.
+ */
+function renderStrip(shown, today) {
+  const bars = monthlyDensity(shown, { rangeKey: state.tlRange, today });
+  const strip = $('tl-strip');
+  const axis = $('tl-axis');
+
+  if (!bars.length) {
+    strip.innerHTML = '';
+    axis.innerHTML = '';
+    $('tl-chart-sub').textContent = '';
+    $('tl-chart-fig').classList.add('hidden');
+    return;
+  }
+  $('tl-chart-fig').classList.remove('hidden');
+
+  const max = Math.max(...bars.map((b) => b.count), 1);
+  const total = bars.reduce((n, b) => n + b.count, 0);
+  // Name the peak month only when there IS one. With three months tied at 2,
+  // "peak 2 in May" points at a month no busier than two others and reads as
+  // a finding rather than a tie.
+  const peakMonths = bars.filter((b) => b.count === max && max > 0);
+  $('tl-chart-sub').textContent = total
+    ? `${total} total · ${peakMonths.length === 1 ? `peak ${max} in ${peakMonths[0].label}` : `peak ${max} a month`}`
+    : 'nothing in this window';
+
+  // The hit target is the whole column, not the bar — a one-event month is a
+  // 3px mark and nobody should have to land on it.
+  strip.innerHTML = bars.map((b) => `
+    <div class="tl-slot${b.count ? '' : ' zero'}" data-month="${esc(b.month)}"
+         tabindex="0" role="listitem"
+         aria-label="${esc(b.label)}: ${b.count} event${b.count === 1 ? '' : 's'}">
+      <span class="tl-tip">${esc(b.label)} · ${b.count} event${b.count === 1 ? '' : 's'}</span>
+      <div class="bar" style="height:${b.count ? Math.max(6, Math.round((b.count / max) * 100)) : 0}%"></div>
+    </div>`).join('');
+
+  // Thin the labels so they never collide: roughly eight, always including the
+  // newest month. The year is kept on January and on the oldest label — a
+  // 13-month strip otherwise shows "Oct" at both ends and says nothing about
+  // which is which.
+  const step = Math.max(1, Math.ceil(bars.length / 8));
+  axis.innerHTML = bars.map((b, i) => {
+    if ((bars.length - 1 - i) % step !== 0) return '<span></span>';
+    const [, m] = b.month.split('-');
+    const keepYear = m === '01' || i === 0 || i === bars.length - 1;
+    return `<span>${esc(keepYear ? b.label.replace(' 20', " '") : b.label.replace(/ \d{4}$/, ''))}</span>`;
+  }).join('');
+
+  strip.querySelectorAll('.tl-slot').forEach((slot) => {
+    const jump = () => {
+      const head = [...$('tl-list').querySelectorAll('.tl-month-name')]
+        .find((h) => h.textContent === monthLabel(slot.dataset.month));
+      head?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      strip.querySelectorAll('.tl-slot').forEach((s) => s.classList.toggle('cur', s === slot));
+    };
+    slot.addEventListener('click', jump);
+    slot.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); jump(); } });
+  });
+}
+
+function eventHtml(e) {
+  const proj = projectById(state.projects, e.projectId);
+  const atts = e.attachments || [];
+  return `
+    <article class="tl-event">
+      <div class="tl-spine">
+        <span class="tl-day">${esc(dayLabel(e.date))}</span>
+        <span class="tl-node" style="background:${esc(proj ? proj.color : 'var(--ink-3)')}"></span>
+        <span class="tl-rail"></span>
+      </div>
+      <div class="tl-body" data-id="${esc(e.id)}">
+        <div class="tl-title">${esc(e.title)}</div>
+        ${proj ? `<div class="tl-proj">${esc(proj.name)}</div>` : ''}
+        ${e.body ? `<div class="tl-text">${esc(e.body)}</div>` : ''}
+        ${atts.length ? `<div class="tl-atts">${atts.map(attChipHtml).join('')}</div>` : ''}
+      </div>
+    </article>`;
+}
+
+const ATT_GLYPH = {
+  image: '<circle cx="12" cy="12" r="9"/><path d="M5 17l4-4 3 3 3-3 4 4"/>',
+  pdf:   '<path d="M7 3h7l4 4v14H7z"/><path d="M14 3v5h5"/>',
+  email: '<rect x="3" y="6" width="18" height="13" rx="2"/><path d="M3.5 7.5 12 13l8.5-5.5"/>',
+  doc:   '<path d="M7 3h7l4 4v14H7z"/><path d="M14 3v5h5"/><path d="M10 13h6M10 17h4"/>',
+  sheet: '<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M4 10h16M10 4v16"/>',
+  slides:'<rect x="3" y="5" width="18" height="12" rx="2"/><path d="M12 17v3"/>',
+  archive:'<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M10 4v6l2-1.5 2 1.5V4"/>',
+  file:  '<path d="M7 3h7l4 4v14H7z"/><path d="M14 3v5h5"/>'
+};
+
+function attChipHtml(a) {
+  return `
+    <button class="att-chip" data-path="${esc(a.path)}" data-name="${esc(a.name)}" title="${esc(a.name)}">
+      <svg class="att-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">${ATT_GLYPH[attachmentKind(a)] || ATT_GLYPH.file}</svg>
+      <span class="n">${esc(a.name)}</span>
+      <span class="sz">${esc(formatBytes(a.size))}</span>
+    </button>`;
+}
+
+/* ---------- attachments ---------- */
+
+async function openAttachment(path, name) {
+  const store = getStore();
+  if (!store) { toast('Cloud Storage is not set up on this project'); return; }
+  try {
+    // Minted on demand rather than stored. A Firebase download URL carries a
+    // token that works forever once issued; keeping one in a plaintext
+    // Firestore document would be a permanent readable handle to the file.
+    const url = await getDownloadURL(storageRef(store, path));
+    window.open(url, '_blank', 'noopener');
+  } catch (err) {
+    console.error(err);
+    toast(`Could not open ${name}`);
+  }
+}
+
+function renderDraftAttachments() {
+  const list = $('ev-att-list');
+  list.innerHTML = state.tlDraftAtts.map((a, i) => `
+    <div class="att-row" data-i="${i}">
+      <span class="n">${esc(a.name)}</span>
+      ${a.uploading
+        ? `<span class="prog"><span style="width:${a.progress || 0}%"></span></span>`
+        : `<span class="sz">${esc(formatBytes(a.size))}</span>`}
+      <button class="x" aria-label="Remove ${esc(a.name)}" ${a.uploading ? 'disabled' : ''}>✕</button>
+    </div>`).join('');
+
+  list.querySelectorAll('.att-row .x').forEach((b) =>
+    b.addEventListener('click', () => removeDraftAttachment(Number(b.closest('.att-row').dataset.i))));
+}
+
+async function addFiles(files) {
+  const store = getStore();
+  if (!store) {
+    $('ev-att-warn').textContent =
+      'Cloud Storage is not provisioned on this Firebase project, so attachments cannot be uploaded. '
+      + 'Firebase console → Storage → Get started. The event itself will still save.';
+    return;
+  }
+  if (!state.tlEditingId) state.tlEditingId = uid('ev');   // need an id to file under
+  $('ev-att-warn').textContent = '';
+
+  for (const file of files) {
+    const check = validateAttachment(file, state.tlDraftAtts);
+    if (!check.ok) { $('ev-att-warn').textContent = check.error; continue; }
+
+    const id = uid('a');
+    const path = attachmentPath(state.user.uid, state.tlEditingId, id, file.name);
+    const draft = { id, name: file.name, size: file.size, type: file.type, path, uploading: true, progress: 0 };
+    state.tlDraftAtts.push(draft);
+    renderDraftAttachments();
+
+    try {
+      const task = uploadBytesResumable(storageRef(store, path), file,
+        { contentType: file.type || 'application/octet-stream' });
+      await new Promise((res, rej) => {
+        task.on('state_changed',
+          (snap) => {
+            draft.progress = Math.round((snap.bytesTransferred / Math.max(1, snap.totalBytes)) * 100);
+            renderDraftAttachments();
+          }, rej, res);
+      });
+      draft.uploading = false;
+      draft.uploadedAt = new Date().toISOString();
+    } catch (err) {
+      console.error(err);
+      state.tlDraftAtts = state.tlDraftAtts.filter((a) => a.id !== id);
+      $('ev-att-warn').textContent =
+        `${file.name} did not upload: ${err?.code === 'storage/unauthorized'
+          ? 'the Storage rules rejected it — publish storage.rules.'
+          : (err?.message || err)}`;
+    }
+    renderDraftAttachments();
+  }
+}
+
+async function removeDraftAttachment(i) {
+  const a = state.tlDraftAtts[i];
+  if (!a) return;
+  state.tlDraftAtts.splice(i, 1);
+  renderDraftAttachments();
+  // Delete the object too. Dropping only the reference would leave the file in
+  // the bucket forever, counting against the quota and still downloadable by
+  // anyone who knows the path.
+  const store = getStore();
+  if (store && a.path) {
+    try { await deleteObject(storageRef(store, a.path)); }
+    catch (err) { if (err?.code !== 'storage/object-not-found') console.warn('Orphaned object:', a.path, err); }
+  }
+}
+
+/* ---------- editor ---------- */
+
+function openEvent(id) {
+  const ev = id ? state.events.find((e) => e.id === id) : null;
+  const src = ev || blankEvent();
+  state.tlEditingId = ev ? id : null;
+  state.tlDraftAtts = (src.attachments || []).map((a) => ({ ...a }));
+
+  $('ev-heading').textContent = ev ? 'Edit event' : 'New event';
+  $('ev-date').value = isDayString(src.date) ? src.date : todayDay();
+  $('ev-title').value = src.title || '';
+  $('ev-body').value = src.body || '';
+  $('ev-error').textContent = '';
+  $('ev-att-warn').textContent = '';
+  $('ev-delete').classList.toggle('hidden', !ev);
+  showInlineProject(false);
+  fillProjectSelect(ev ? src.projectId : (state.tlProject && state.tlProject !== UNASSIGNED ? state.tlProject : ''));
+  renderDraftAttachments();
+
+  $('ev-ov').classList.add('show');
+  $('ev-title').focus();
+}
+
+function closeEvent() {
+  $('ev-ov').classList.remove('show');
+  state.tlEditingId = null;
+  state.tlDraftAtts = [];
+  ['ev-title', 'ev-body', 'ev-project-name'].forEach((id) => { $(id).value = ''; });
+  $('ev-att-list').innerHTML = '';
+  showInlineProject(false);
+}
+
+async function saveEvent() {
+  const event = {
+    title: $('ev-title').value.trim(),
+    date: $('ev-date').value,
+    body: $('ev-body').value,
+    projectId: $('ev-project').value || '',
+    attachments: state.tlDraftAtts.filter((a) => !a.uploading).map(normaliseAttachment).filter(Boolean)
+  };
+
+  const check = validateEvent(event);
+  if (!check.ok) { $('ev-error').textContent = check.error; return; }
+  if (state.tlDraftAtts.some((a) => a.uploading)) {
+    $('ev-error').textContent = 'Wait for the uploads to finish.';
+    return;
+  }
+
+  const id = state.tlEditingId || uid('ev');
+  const now = new Date().toISOString();
+  const existing = state.events.find((e) => e.id === id);
+
+  try {
+    await setDoc(eventRef(id), {
+      ...eventBody(event),
+      createdAt: existing?.createdAt || now,
+      updatedAt: now
+    });
+    closeEvent();
+    toast(existing ? 'Event saved' : 'Event recorded', true);
+  } catch (err) {
+    console.error(err);
+    $('ev-error').textContent = `Could not save: ${err?.message || err}`;
+  }
+}
+
+async function deleteEvent(id) {
+  const ev = state.events.find((e) => e.id === id);
+  const n = ev?.attachments?.length || 0;
+  const ok = await askConfirm(
+    `"${ev?.title || 'This event'}" will be deleted`
+    + (n ? `, along with ${n} attachment${n === 1 ? '' : 's'}.` : '.')
+    + ' There is no undo.',
+    'Delete event?'
+  );
+  if (!ok) return;
+
+  try {
+    // Files first. A failed document delete leaves an event with dead
+    // attachments, which is visible and fixable; the reverse leaves files in
+    // the bucket that nothing references and nobody will ever find.
+    const store = getStore();
+    if (store) {
+      for (const a of ev?.attachments || []) {
+        try { await deleteObject(storageRef(store, a.path)); }
+        catch (err) { if (err?.code !== 'storage/object-not-found') console.warn('Orphaned object:', a.path, err); }
+      }
+    }
+    await deleteDoc(eventRef(id));
+    closeEvent();
+    toast('Event deleted', true);
+  } catch (err) { console.error(err); toast('Could not delete the event'); }
+}
+
+/* ---------- projects ---------- */
+
+function fillProjectSelect(selected) {
+  const sel = $('ev-project');
+  sel.innerHTML = '<option value="">Unassigned</option>'
+    + state.projects.map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
+  sel.value = selected && state.projects.some((p) => p.id === selected) ? selected : '';
+}
+
+function showInlineProject(show) {
+  $('ev-project-new-row').classList.toggle('hidden', !show);
+  if (show) { $('ev-project-name').value = ''; $('ev-project-name').focus(); }
+}
+
+async function createProjectInline() {
+  const name = $('ev-project-name').value;
+  const project = { ...blankProject(state.projects.length), name: name.trim() };
+  const check = validateProject(project, state.projects);
+  if (!check.ok) { $('ev-error').textContent = check.error; return; }
+
+  const id = uid('p');
+  try {
+    await setDoc(projectRef(id), { ...project, createdAt: new Date().toISOString() });
+    $('ev-error').textContent = '';
+    showInlineProject(false);
+    fillProjectSelect(id);
+    setTimeout(() => { if ($('ev-ov').classList.contains('show')) fillProjectSelect(id); }, 400);
+  } catch (err) {
+    console.error(err);
+    $('ev-error').textContent = `Could not create the project: ${err?.message || err}`;
+  }
+}
+
+/* ---------- timeline wiring ---------- */
+
+$('tl-new').addEventListener('click', () => openEvent(null));
+$('tl-search').addEventListener('input', () => { state.tlQuery = $('tl-search').value; renderTimeline(); });
+
+$('ev-x').addEventListener('click', closeEvent);
+$('ev-cancel').addEventListener('click', closeEvent);
+$('ev-save').addEventListener('click', saveEvent);
+$('ev-delete').addEventListener('click', () => { if (state.tlEditingId) deleteEvent(state.tlEditingId); });
+$('ev-ov').addEventListener('click', (e) => { if (e.target.id === 'ev-ov') closeEvent(); });
+
+$('ev-project-new').addEventListener('click', () => showInlineProject(true));
+$('ev-project-cancel').addEventListener('click', () => showInlineProject(false));
+$('ev-project-save').addEventListener('click', createProjectInline);
+$('ev-project-name').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); createProjectInline(); }
+  if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); showInlineProject(false); }
+});
+
+$('ev-attach').addEventListener('click', () => $('ev-files').click());
+$('ev-files').addEventListener('change', (e) => {
+  const files = [...(e.target.files || [])];
+  e.target.value = '';
+  if (files.length) addFiles(files);
+});
+
+const drop = $('ev-drop');
+['dragenter', 'dragover'].forEach((t) => drop.addEventListener(t, (e) => {
+  e.preventDefault(); drop.classList.add('over');
+}));
+['dragleave', 'drop'].forEach((t) => drop.addEventListener(t, () => drop.classList.remove('over')));
+drop.addEventListener('drop', (e) => {
+  e.preventDefault();
+  const files = [...(e.dataTransfer?.files || [])];
+  if (files.length) addFiles(files);
+});

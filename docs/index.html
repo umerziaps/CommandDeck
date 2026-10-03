@@ -63,6 +63,7 @@
           Vault
           <svg class="lock-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
         </button>
+        <button data-view="timeline">Timeline</button>
       </div>
       <div class="theme-tog" id="theme-tog">
         <button data-theme-set="light" title="Light" aria-label="Light theme">
@@ -187,6 +188,35 @@
       <div id="v-list" class="v-list"></div>
     </section>
   </div><!-- /vault-view -->
+
+  <!-- ============ timeline view ============ -->
+  <div id="timeline-view" class="hidden">
+
+    <!-- Filters in one row above the chart, never inside the chart card. -->
+    <div class="tl-bar">
+      <div class="tl-search">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+        <input type="search" id="tl-search" placeholder="Search events…" autocomplete="off">
+      </div>
+      <div class="range-tog" id="tl-range" role="group" aria-label="Time range"></div>
+      <button class="btn-primary compact" id="tl-new">New event</button>
+    </div>
+
+    <div class="proj-bar" id="tl-proj-bar"></div>
+
+    <!-- The zoom-out. One series, so no legend: the title says what is plotted.
+         Every value is also readable in the list below, which is the table view. -->
+    <figure class="tl-chart" id="tl-chart-fig">
+      <figcaption class="tl-chart-head">
+        <span class="tl-chart-title">Events per month</span>
+        <span class="tl-chart-sub" id="tl-chart-sub"></span>
+      </figcaption>
+      <div class="tl-strip" id="tl-strip" role="img" aria-label="Events per month"></div>
+      <div class="tl-axis" id="tl-axis"></div>
+    </figure>
+
+    <div id="tl-list" class="tl-list"></div>
+  </div><!-- /timeline-view -->
 </div>
 
 <!-- ============ menu sheet ============ -->
@@ -315,6 +345,60 @@
         <div class="spacer"></div>
         <button class="btn-quiet" id="e-cancel">Cancel</button>
         <button class="btn-primary" id="e-save">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ timeline event editor ============ -->
+<div class="ov" id="ev-ov">
+  <div class="sheet wide">
+    <div class="sheet-head">
+      <h3 id="ev-heading">New event</h3>
+      <button class="sheet-x" id="ev-x" aria-label="Close">✕</button>
+    </div>
+
+    <div class="entry-form">
+      <div class="ev-row">
+        <div class="ev-col">
+          <label class="vault-label" for="ev-date">Date it happened</label>
+          <input type="date" id="ev-date">
+        </div>
+        <div class="ev-col">
+          <label class="vault-label" for="ev-project">Project</label>
+          <div class="group-pick-row">
+            <select id="ev-project"></select>
+            <button class="btn-quiet compact" id="ev-project-new" type="button">New</button>
+          </div>
+        </div>
+      </div>
+      <div class="group-new-row hidden" id="ev-project-new-row">
+        <input type="text" id="ev-project-name" placeholder="Ocufii 2.0" autocomplete="off" maxlength="80">
+        <button class="btn-primary compact" id="ev-project-save" type="button">Create</button>
+        <button class="btn-quiet compact" id="ev-project-cancel" type="button">Cancel</button>
+      </div>
+
+      <label class="vault-label" for="ev-title">What happened</label>
+      <input type="text" id="ev-title" placeholder="Client delivered the SDS specs" autocomplete="off">
+
+      <label class="vault-label" for="ev-body">Detail</label>
+      <textarea id="ev-body" rows="5" placeholder="Context you will not remember in six months."></textarea>
+
+      <label class="vault-label">Attachments</label>
+      <div class="att-drop" id="ev-drop">
+        <input type="file" id="ev-files" multiple hidden>
+        <button type="button" class="btn-quiet compact" id="ev-attach">Add files</button>
+        <span class="att-hint">or drop them here · 10 MB each, 12 per event</span>
+      </div>
+      <div class="att-list" id="ev-att-list"></div>
+      <p class="att-warn" id="ev-att-warn"></p>
+
+      <p class="vault-error" id="ev-error"></p>
+      <div class="entry-actions">
+        <button class="btn-danger ghost" id="ev-delete">Delete</button>
+        <div class="spacer"></div>
+        <button class="btn-quiet" id="ev-cancel">Cancel</button>
+        <button class="btn-primary" id="ev-save">Save</button>
       </div>
     </div>
   </div>

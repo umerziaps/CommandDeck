@@ -27,6 +27,21 @@ service cloud.firestore {
         allow create, update: if isOwner(userId) && validCategory();
       }
 
+      // ---- work timeline ----
+      //
+      // Plaintext, unlike the vault. These rules are therefore the ONLY thing
+      // protecting the contents, not a second line behind encryption — which
+      // is worth remembering before anything client-confidential is attached.
+      match /events/{eventId} {
+        allow read, delete: if isOwner(userId);
+        allow create, update: if isOwner(userId) && validEvent();
+      }
+
+      match /projects/{projectId} {
+        allow read, delete: if isOwner(userId);
+        allow create, update: if isOwner(userId) && validProject();
+      }
+
       // ---- credentials vault ----
       //
       // These rules are a second line of defence, not the first. The vault's
@@ -111,6 +126,25 @@ service cloud.firestore {
           // which is how every group is born. Requiring it would reject group
           // creation outright with a permission error.
           && (!d.keys().hasAny(['updatedAt']) || d.updatedAt is string);
+    }
+
+    function validEvent() {
+      let d = request.resource.data;
+      return d.title is string && d.title.size() > 0 && d.title.size() <= 200
+          && d.date is string && d.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+          && d.body is string && d.body.size() <= 20000
+          && d.projectId is string
+          && d.attachments is list
+          && d.attachments.size() <= 12
+          && d.createdAt is string
+          && d.updatedAt is string;
+    }
+
+    function validProject() {
+      let d = request.resource.data;
+      return d.name is string && d.name.size() > 0 && d.name.size() <= 80
+          && d.color is string && d.color.matches('^#[0-9A-Fa-f]{6}$')
+          && d.createdAt is string;
     }
 
     function validCategory() {

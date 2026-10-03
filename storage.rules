@@ -1,0 +1,61 @@
+rules_version = '2';
+
+// Command Deck — Cloud Storage rules for timeline attachments.
+//
+// Publish these: Firebase console → Storage → Rules → Publish, or
+//   firebase deploy --only storage
+// (the deploy-rules job in .github/workflows/web.yml does both).
+//
+// READ THIS BEFORE PUBLISHING. Timeline attachments are NOT encrypted — unlike
+// the vault, where the rules are a second line of defence behind client-side
+// encryption and a breach yields ciphertext. Here a mistake in this file is the
+// whole story: anyone who can read the path can read the file. If a client's
+// specification document is in this bucket, these twenty lines are what is
+// standing between it and the internet.
+//
+// Firebase's default rules for a new bucket allow any signed-in user to read
+// and write anything in it. Any Google account in the world can sign in to this
+// project. Do not leave the defaults in place.
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // Attachments live under the owner's uid and nobody else's.
+    match /users/{userId}/events/{eventId}/{fileName} {
+
+      allow read: if isOwner(userId);
+
+      allow write: if isOwner(userId)
+                   && request.resource.size <= 10 * 1024 * 1024
+                   // No executables or scripts. Nothing in this app ever runs
+                   // an uploaded file, but a bucket that will serve one over
+                   // HTTPS from a Google domain is a gift to anyone looking
+                   // for somewhere to host a payload.
+                   && !request.resource.contentType.matches('.*(javascript|html|x-msdownload|x-sh|x-executable).*');
+
+      allow delete: if isOwner(userId);
+    }
+
+    // Everything else is denied. Leave it that way — including the bucket
+    // root, which is where a mis-pathed upload would otherwise land.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------
+// Optional hardening, matching the note in firestore.rules: once you know
+// your own uid, pin access to exactly that account so a stranger who signs
+// in with Google cannot create their own folder in your bucket.
+//
+//   function isOwner(userId) {
+//     return request.auth != null
+//         && request.auth.uid == userId
+//         && request.auth.uid == 'PASTE_YOUR_UID_HERE';
+//   }
+// ---------------------------------------------------------------------
