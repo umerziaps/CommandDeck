@@ -14,7 +14,8 @@ import {
   blankRelease, normaliseRelease, releaseBody, validateRelease, releaseLabel,
   releaseOrder, filterReleases, environments, latestInProduction, appSummary,
   locationKind, isOpenable, shortLocation,
-  parseMailDate, parseReleaseLine, parseBuildEmail, dedupeReleases
+  parseMailDate, parseReleaseLine, parseBuildEmail, dedupeReleases,
+  tidyChanges, mergeNotes
 } from './releases.js';
 
 const TODAY = '2026-10-03';
@@ -382,4 +383,114 @@ test('releaseBody keeps exactly the stored fields', () => {
     'appId', 'artifactUrl', 'build', 'buildDate', 'changes', 'env',
     'notes', 'prodDate', 'production', 'sourceUrl', 'version'
   ]);
+});
+
+/* ---------- tidying a human email into a changelog ---------- *
+ *
+ * From a real import: the changes field carried the build's own version and
+ * SDK levels (already in notes) plus a request to report issues, and the
+ * actual change was one line in the middle of it.
+ */
+
+const MESSY = `The completed work includes:
+Audit log for Account creation and deletion is sometimes missing has been fixed
+Version Details:
+• Version Name: 1.0.1
+• Version Code: 9
+• Maximum SDK: 36
+• Minimum SDK: 26
+The implementation is complete and ready for QA/testing. Please let me know if any issues are identified or if any additional changes are required.`;
+
+test('version and SDK lines are lifted out of the changelog', () => {
+  const { changes, metadata } = tidyChanges(MESSY);
+  assert.doesNotMatch(changes, /Version Code/);
+  assert.doesNotMatch(changes, /Minimum SDK/);
+  assert.doesNotMatch(changes, /Version Details/);
+  assert.deepEqual(metadata, ['Version Name: 1.0.1', 'Version Code: 9', 'Maximum SDK: 36', 'Minimum SDK: 26']);
+});
+
+test('the actual change survives tidying', () => {
+  // The whole point. Trimming is only worth doing if it never eats content.
+  assert.match(tidyChanges(MESSY).changes, /Audit log for Account creation and deletion/);
+});
+
+test('a request addressed to the reader is dropped, the statement beside it is not', () => {
+  const { changes } = tidyChanges(MESSY);
+  assert.doesNotMatch(changes, /Please let me know/);
+  assert.doesNotMatch(changes, /additional changes are required/);
+  assert.match(changes, /ready for QA\/testing/, 'that sentence describes the build and stays');
+});
+
+test('greetings and sign-offs go', () => {
+  const { changes } = tidyChanges('Dear Team,\nFixed the crash\nRegards,');
+  assert.equal(changes, 'Fixed the crash');
+});
+
+test('an ordinary changelog is returned untouched', () => {
+  const plain = '• Added support for FlexiDoor Beacon\n• Replaced Face ID with Two-Factor Authentication (2FA)';
+  assert.equal(tidyChanges(plain).changes, plain);
+  assert.deepEqual(tidyChanges(plain).metadata, []);
+});
+
+test('a line that merely mentions a version is not mistaken for metadata', () => {
+  // "Version Code: 9" is metadata. "Upgraded to version 2 of the SDK" is a change.
+  const { changes, metadata } = tidyChanges('Upgraded to version 2 of the beacon SDK');
+  assert.match(changes, /Upgraded to version 2/);
+  assert.deepEqual(metadata, []);
+});
+
+test('tidying is safe on empty and whitespace input', () => {
+  assert.deepEqual(tidyChanges(''), { changes: '', metadata: [] });
+  assert.deepEqual(tidyChanges(null), { changes: '', metadata: [] });
+  assert.equal(tidyChanges('\n\n  \n').changes, '');
+});
+
+test('merging metadata into notes does not repeat what is already there', () => {
+  const notes = 'Build type: Flashed\nMinimum SDK: 26';
+  const merged = mergeNotes(notes, ['Minimum SDK: 26', 'Version Code: 9']);
+  assert.equal((merged.match(/Minimum SDK: 26/g) || []).length, 1);
+  assert.match(merged, /Version Code: 9/);
+});
+
+test('merging into empty notes does not leave a leading blank line', () => {
+  assert.equal(mergeNotes('', ['Version Code: 9']), 'Version Code: 9');
+  assert.equal(mergeNotes(null, []), '');
+});
+
+test('the template parser now produces a clean changelog from a messy email', () => {
+  const email = `BUILD DETAILS
+Release: v1.0.1 (9)
+Environment: (US West Oregon)
+ARTIFACT DETAILS
+Path (FS04): \\\\fs04\\out
+SOURCE CODE DETAILS
+Path (FS04): \\\\fs04\\src
+SCOPE OF THIS RELEASE
+${MESSY}
+CONFIGURATION NOTES (OPTIONAL)
+- Minimum SDK: 26
+- Maximum SDK 36`;
+  const r = parseBuildEmail(email, { defaultDate: TODAY }).releases[0];
+  assert.match(r.changes, /Audit log/);
+  assert.doesNotMatch(r.changes, /Please let me know/);
+  assert.doesNotMatch(r.changes, /Version Code/);
+  assert.match(r.notes, /Version Code: 9/, 'the metadata moved rather than vanishing');
+  assert.equal((r.notes.match(/Minimum SDK: 26/g) || []).length, 1, 'and is not duplicated');
+});
+
+/* ---------- shortening a path ---------- */
+
+test('a long path keeps both ends, so it still reads as a path', () => {
+  // Cutting the front produced "…s04\\Integra\\…", which looks like a broken
+  // string rather than a shortened one.
+  const p = '\\\\fs04\\Integra\\OCUFII\\source code\\Android\\Regal VA';
+  const short = shortLocation(p, 30);
+  assert.ok(short.startsWith('\\\\fs04'), `lost the server name: ${short}`);
+  assert.ok(short.endsWith('Regal VA'), `lost the leaf: ${short}`);
+  assert.ok(short.includes('…'));
+  assert.ok(short.length <= 30);
+});
+
+test('a path that fits is not touched', () => {
+  assert.equal(shortLocation('\\\\fs04\\out', 52), '\\\\fs04\\out');
 });

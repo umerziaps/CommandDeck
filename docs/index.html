@@ -466,6 +466,14 @@
         <textarea id="imp-text" rows="6" spellcheck="false" placeholder="Paste the email body…"></textarea>
       </details>
 
+      <label class="vault-label">Read it with</label>
+      <div class="kind-tog" id="imp-reader" role="group" aria-label="Which reader">
+        <button type="button" data-reader="auto" class="on">Auto</button>
+        <button type="button" data-reader="template">Built-in parser</button>
+        <button type="button" data-reader="claude">Claude</button>
+      </div>
+      <p class="att-hint" id="imp-reader-note">Auto uses the built-in parser when it recognises the format, and Claude when it does not.</p>
+
       <div class="imp-actions">
         <button class="btn-quiet compact" id="imp-parse">Read it</button>
         <span class="att-hint" id="imp-status"></span>

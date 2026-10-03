@@ -55,7 +55,7 @@ import {
   PLATFORMS, platformLabel, blankApp, normaliseApp, appBody, validateApp, appOrder, appById,
   blankRelease, normaliseRelease, releaseBody, validateRelease, releaseLabel, releaseOrder,
   filterReleases, environments, appSummary, locationKind, isOpenable, shortLocation,
-  parseBuildEmail, dedupeReleases, APP_PALETTE
+  parseBuildEmail, dedupeReleases, APP_PALETTE, tidyChanges, mergeNotes
 } from './releases.js';
 import { readEmlFile } from './eml.js';
 import {
@@ -182,6 +182,7 @@ const state = {
   rlEditingId: null,
   impParsed: [],
   impFile: null,        // { name, bytes, text } once an .eml is read
+  impReader: 'auto',    // auto | template | claude
   apEditingId: null,
   apColor: APP_PALETTE[0],
   apFile: null,
@@ -2833,6 +2834,18 @@ function resetImport() {
   $('imp-ai').classList.add('hidden');
   $('imp-save').disabled = true;
   $('imp-file-row').classList.add('hidden');
+  setReader(state.impReader);
+}
+
+function setReader(which) {
+  state.impReader = which;
+  document.querySelectorAll('#imp-reader button')
+    .forEach((b) => b.classList.toggle('on', b.dataset.reader === which));
+  $('imp-reader-note').textContent = which === 'template'
+    ? 'Free and instant, but only for formats it recognises.'
+    : which === 'claude'
+      ? 'Reads any format. Costs a fraction of a cent, and needs the vault unlocked for the stored key.'
+      : 'Auto uses the built-in parser when it recognises the format, and Claude when it does not.';
 }
 
 async function takeEmlFile(file, { nameId = 'imp-file-name', sizeId = 'imp-file-size', rowId = 'imp-file-row', errId = 'imp-error' } = {}) {
@@ -2878,15 +2891,27 @@ async function readImport() {
 
   let parsed = [];
   let usedClaude = false;
-  const template = parseBuildEmail(text, { defaultDate: todayDay() });
+
+  // Auto tries the template parser first because it is free and instant. It is
+  // NOT the only option: the template parser recognising a format is not the
+  // same as reading it well, and before this was selectable the Claude path
+  // could never run for a format that merely looked familiar.
+  const template = state.impReader === 'claude'
+    ? { ok: false, releases: [] }
+    : parseBuildEmail(text, { defaultDate: todayDay() });
+
   if (template.ok && template.releases.length) {
     parsed = template.releases;
+  } else if (state.impReader === 'template') {
+    $('imp-status').textContent = '';
+    $('imp-error').textContent = 'The built-in parser did not recognise this format. Try Claude instead.';
+    return;
   } else {
     if (!state.apiKey) {
       $('imp-status').textContent = '';
       $('imp-error').textContent = state.apiKeyPresent && !vault.key
-        ? 'The built-in parser did not recognise this format. Unlock the vault so the Claude key can be used.'
-        : 'The built-in parser did not recognise this format. Add a Claude API key (⋯ menu) and it will read it instead.';
+        ? 'Unlock the vault so the stored Claude key can be used.'
+        : 'No Claude API key stored. Add one from the ⋯ menu.';
       return;
     }
     try {
@@ -2913,11 +2938,19 @@ async function readImport() {
     return;
   }
 
+  // Both readers scoop up whatever followed the changes heading in a human
+  // email — a note that it is ready for QA, a request to report problems, the
+  // version and SDK restated. Lift that out of the changelog either way.
+  parsed = parsed.map((r) => {
+    const t = tidyChanges(r.changes);
+    return { ...r, changes: t.changes, notes: mergeNotes(r.notes, t.metadata) };
+  });
+
   const { fresh, skipped } = dedupeReleases(parsed, state.releases, appId);
   state.impParsed = fresh.map((r) => ({ ...blankRelease(appId, todayDay()), ...r, appId }));
   $('imp-save').disabled = !fresh.length;
   $('imp-status').textContent =
-    `${parsed.length} found${usedClaude ? ' by Claude' : ''} · ${fresh.length} new${skipped ? ` · ${skipped} already recorded` : ''}`;
+    `${parsed.length} found by ${usedClaude ? 'Claude' : 'the built-in parser'} · ${fresh.length} new${skipped ? ` · ${skipped} already recorded` : ''}`;
 
   $('imp-preview').innerHTML = fresh.length
     ? fresh.map((r) => `
@@ -3105,6 +3138,8 @@ $('rl-apps').addEventListener('click', openApps);
 $('imp-x').addEventListener('click', () => $('imp-ov').classList.remove('show'));
 $('imp-cancel').addEventListener('click', () => $('imp-ov').classList.remove('show'));
 $('imp-ov').addEventListener('click', (e) => { if (e.target.id === 'imp-ov') $('imp-ov').classList.remove('show'); });
+document.querySelectorAll('#imp-reader button').forEach((b) =>
+  b.addEventListener('click', () => { setReader(b.dataset.reader); $('imp-save').disabled = true; }));
 $('imp-parse').addEventListener('click', readImport);
 $('imp-save').addEventListener('click', runImport);
 $('imp-text').addEventListener('input', () => { $('imp-save').disabled = true; $('imp-status').textContent = ''; });

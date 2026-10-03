@@ -238,10 +238,89 @@ export function locationKind(s) {
 export const isOpenable = (s) => locationKind(s) === 'url';
 
 /** A short label for a long location, keeping the end that identifies it. */
-export function shortLocation(s, max = 48) {
+export function shortLocation(s, max = 52) {
   const v = (s || '').trim();
   if (v.length <= max) return v;
-  return `…${v.slice(-(max - 1))}`;
+  // Elide the middle, not the front. Cutting the front turns
+  // \\fs04\Integra\...\Regal VA into "…s04\Integra\...", which looks like a
+  // broken string rather than a shortened one. The server and the leaf are
+  // what identify a path; the middle is what can go.
+  const head = Math.max(8, Math.floor((max - 1) * 0.35));
+  const tail = max - 1 - head;
+  return `${v.slice(0, head)}…${v.slice(-tail)}`;
+}
+
+/* ---------- tidying what comes out of an email ---------- *
+ *
+ * "SCOPE OF THIS RELEASE" is a heading in a human email, not a field. What
+ * follows it runs on into whatever the author wrote next: a note that the
+ * build is ready for QA, a request to be told about problems, a restatement of
+ * the version and SDK levels. Scooping all of that into `changes` produces a
+ * changelog nobody wants to read and buries the two lines that matter.
+ *
+ * These are conservative: a line is dropped only when it is unambiguously
+ * addressed to the reader rather than describing the build, and metadata is
+ * moved rather than discarded.
+ */
+
+// Addressed to the reader, not a description of the build.
+const COURTESY = [
+  /\bplease\s+(let me know|review|confirm|advise|check|test|share)\b/i,
+  /\blet (me|us) know\b/i,
+  /\bfeel free to\b/i,
+  /\bif any issues? (are|is) (identified|found|observed)\b/i,
+  /\bif any additional changes? (are|is) required\b/i,
+  /\b(kindly|do) (confirm|review|advise)\b/i,
+  /\bthanks? (and regards|in advance)\b/i
+];
+
+const GREETING = /^(dear|hi|hello|hey)\b[^.!?]{0,40}[,:]?\s*$/i;
+const SIGNOFF = /^(regards|best regards|kind regards|thanks|thank you|br|sincerely|cheers)\b[,.]?\s*$/i;
+
+// Build metadata that belongs in notes rather than in the changelog.
+const METADATA = /^[•*\-\d.\s]*((version\s*(name|code))|((minimum|maximum|min|max)\s*sdk)|target\s*sdk|build\s*type)\s*[:=]/i;
+const METADATA_HEADER = /^[•*\-\s]*(version details|configuration notes)\s*[:(]?/i;
+
+const splitSentences = (line) => line.split(/(?<=[.!?])\s+/);
+
+/**
+ * Returns { changes, metadata } — the changelog with courtesy and metadata
+ * removed, and the metadata lines that were lifted out of it.
+ */
+export function tidyChanges(raw) {
+  const metadata = [];
+  const kept = [];
+
+  for (const line of String(raw || '').split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) { kept.push(''); continue; }
+    if (GREETING.test(trimmed) || SIGNOFF.test(trimmed)) continue;
+
+    if (METADATA.test(trimmed)) {
+      metadata.push(trimmed.replace(/^[•*\-\s]+/, ''));
+      continue;
+    }
+    if (METADATA_HEADER.test(trimmed)) continue;
+
+    // A line can hold a real statement and a request in the same breath.
+    const sentences = splitSentences(trimmed).filter((s) => !COURTESY.some((re) => re.test(s)));
+    const rebuilt = sentences.join(' ').trim();
+    if (rebuilt) kept.push(rebuilt);
+  }
+
+  // A trailing heading left with nothing under it, and runs of blank lines.
+  const changes = kept.join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/^[\s\n]+|[\s\n]+$/g, '');
+
+  return { changes, metadata };
+}
+
+/** Folds lifted metadata into notes without repeating what is already there. */
+export function mergeNotes(notes, metadata) {
+  const have = String(notes || '').split('\n').map((l) => l.trim().toLowerCase()).filter(Boolean);
+  const add = metadata.filter((m) => !have.includes(m.trim().toLowerCase()));
+  return [String(notes || '').trim(), ...add].filter(Boolean).join('\n');
 }
 
 /* ================================================================== *
@@ -358,18 +437,20 @@ export function parseBuildEmail(raw, { defaultDate = '' } = {}) {
     const artifactUrl = field(chunk, /ARTIFACT DETAILS[\s\S]{0,400}?^\s*Path[^:\n]*:\s*(.+)$/im);
     const sourceUrl = field(chunk, /SOURCE CODE DETAILS[\s\S]{0,400}?^\s*Path[^:\n]*:\s*(.+)$/im);
 
-    const changes = field(chunk,
+    const rawChanges = field(chunk,
       /SCOPE OF THIS RELEASE\s*\n([\s\S]*?)(?=\n\s*CONFIGURATION NOTES|\n\s*Regards|\n\s*From\s*:|\n\s*_{5,}|$)/i)
       .split('\n').map((l) => l.replace(/^\s*[*•·]\s*/, '• ').trimEnd()).filter((l) => l.trim())
       .join('\n').trim();
+    const tidied = tidyChanges(rawChanges);
+    const changes = tidied.changes;
 
     const minSdk = field(chunk, /Minimum SDK\s*:?\s*(\d+)/i);
     const maxSdk = field(chunk, /Maximum SDK\s*:?\s*(\d+)/i);
-    const notes = [
+    const notes = mergeNotes([
       buildType ? `Build type: ${buildType}` : '',
       minSdk ? `Minimum SDK: ${minSdk}` : '',
       maxSdk ? `Maximum SDK: ${maxSdk}` : ''
-    ].filter(Boolean).join('\n');
+    ].filter(Boolean).join('\n'), tidied.metadata);
 
     // "v1.3.0 (169,170,171)" with "Demo, Sqa, Production" is three builds in
     // one announcement. Pair them up when the counts agree; otherwise the
