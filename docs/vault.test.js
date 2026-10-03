@@ -25,6 +25,9 @@ import {
   plainPunctuation, hasSmartPunctuation,
   blankEntry, normaliseEntry, entryBody, entryOrder,
   blankGroup, normaliseGroup, groupBody, groupOrder, groupById, validateGroup,
+  nextEntryOrder, planReorder,
+  buildEncryptedExport, buildPlainExport, parseVaultExport, readVaultExport,
+  EXPORT_FORMAT, EXPORT_VERSION,
   countByGroup, filterByGroup, sectionsByGroup, entryGroupId,
   GROUP_PALETTE, UNGROUPED,
   validateEntry, validatePassphrase, vaultSearch,
@@ -620,4 +623,210 @@ test('entries are sorted by name inside each section', () => {
 test('groupById returns null rather than undefined for a missing group', () => {
   assert.equal(groupById([G('g1', 'AWS', '1')], 'nope'), null);
   assert.equal(groupById([], 'g1'), null);
+});
+
+/* ---------- hand-chosen position ---------- */
+
+const O = (id, title, order, groupId = '') =>
+  ({ id, title, order, groupId, createdAt: '2026-01-01T00:00:00Z' });
+
+test('order comes from the document, not the ciphertext', () => {
+  assert.equal(normaliseEntry('e1', { title: 'a' }, { order: 7 }).order, 7);
+  assert.equal(normaliseEntry('e1', { title: 'a' }, {}).order, 0, 'missing order must not be NaN');
+  assert.equal(normaliseEntry('e1', { title: 'a' }, { order: 'x' }).order, 0);
+  assert.equal(normaliseEntry('e1', { title: 'a' }, { order: Infinity }).order, 0);
+});
+
+test('a vault nobody has dragged is still alphabetical', () => {
+  // Everything starts at order 0, so positioning costs nothing until used.
+  const names = [O('1', 'zoom', 0), O('2', 'Apple', 0), O('3', 'bank', 0)]
+    .sort(entryOrder).map((e) => e.title);
+  assert.deepEqual(names, ['Apple', 'bank', 'zoom']);
+});
+
+test('once dragged, position beats the alphabet', () => {
+  const names = [O('1', 'Apple', 2), O('2', 'bank', 0), O('3', 'zoom', 1)]
+    .sort(entryOrder).map((e) => e.title);
+  assert.deepEqual(names, ['bank', 'zoom', 'Apple']);
+});
+
+test('a new entry lands at the bottom of its own group, not the vault', () => {
+  const entries = [O('1', 'a', 0, 'g1'), O('2', 'b', 1, 'g1'), O('3', 'c', 5, '')];
+  const groups = [G('g1', 'VMs', '1')];
+  assert.equal(nextEntryOrder(entries, groups, 'g1'), 2);
+  assert.equal(nextEntryOrder(entries, groups, ''), 6);
+  assert.equal(nextEntryOrder([], groups, 'g1'), 0);
+});
+
+test('dragging a row down rewrites only the rows that actually moved', () => {
+  const groups = [];
+  const entries = [O('a', 'a', 0), O('b', 'b', 1), O('c', 'c', 2), O('d', 'd', 3)];
+  const plan = planReorder(entries, groups, 'a', 'c', true);   // a to just after c
+  assert.deepEqual(plan.positions, [{ id: 'b', order: 0 }, { id: 'c', order: 1 }, { id: 'a', order: 2 }]);
+  assert.equal(plan.positions.some((p) => p.id === 'd'), false, 'd never moved and must not be written');
+  assert.equal(plan.movedToGroup, null);
+});
+
+test('dragging a row up puts it above the target', () => {
+  const entries = [O('a', 'a', 0), O('b', 'b', 1), O('c', 'c', 2)];
+  const plan = planReorder(entries, [], 'c', 'a', false);
+  const final = [...entries].map((e) => {
+    const moved = plan.positions.find((p) => p.id === e.id);
+    return { id: e.id, order: moved ? moved.order : e.order };
+  }).sort((x, y) => x.order - y.order).map((e) => e.id);
+  assert.deepEqual(final, ['c', 'a', 'b']);
+});
+
+test('dropping into another group reports the move so only that row is re-encrypted', () => {
+  const groups = [G('g1', 'AWS', '1'), G('g2', 'VMs', '2')];
+  const entries = [O('a', 'a', 0, 'g1'), O('b', 'b', 0, 'g2'), O('c', 'c', 1, 'g2')];
+  const plan = planReorder(entries, groups, 'a', 'c', false);
+  assert.equal(plan.movedToGroup, 'g2');
+  assert.equal(plan.sourceId, 'a');
+  assert.deepEqual(plan.positions.map((p) => p.id).sort(), ['a', 'c']);
+});
+
+test('a drag within one group never reports a group change', () => {
+  const groups = [G('g1', 'AWS', '1')];
+  const entries = [O('a', 'a', 0, 'g1'), O('b', 'b', 1, 'g1')];
+  assert.equal(planReorder(entries, groups, 'a', 'b', true).movedToGroup, null);
+});
+
+test('a drag that goes nowhere is refused rather than writing a no-op', () => {
+  const entries = [O('a', 'a', 0), O('b', 'b', 1)];
+  assert.equal(planReorder(entries, [], 'a', 'a', false), null);
+  assert.equal(planReorder(entries, [], 'ghost', 'b', false), null);
+  assert.equal(planReorder(entries, [], 'a', 'ghost', false), null);
+});
+
+test('reordering never loses an entry', () => {
+  const entries = [O('a', 'a', 0), O('b', 'b', 1), O('c', 'c', 2), O('d', 'd', 3)];
+  for (const [src, tgt, after] of [['a','d',true], ['d','a',false], ['b','c',true], ['c','b',false]]) {
+    const plan = planReorder(entries, [], src, tgt, after);
+    const positions = new Map(plan.positions.map((p) => [p.id, p.order]));
+    const final = entries.map((e) => ({ id: e.id, order: positions.has(e.id) ? positions.get(e.id) : e.order }));
+    assert.equal(new Set(final.map((e) => e.id)).size, 4, `${src}->${tgt} lost an entry`);
+    assert.equal(new Set(final.map((e) => e.order)).size, 4, `${src}->${tgt} produced a duplicate position`);
+  }
+});
+
+/* ---------- export and restore ---------- */
+
+test('an encrypted export carries ciphertext and the inputs needed to open it', async () => {
+  const { config, key } = await createVaultConfig(PASS, FAST);
+  const blob = await encryptJson(key, entryBody({ ...blankEntry(), title: 'Chase Bank', password: 'S3cr3t!' }), { aad: 'e1' });
+  const file = buildEncryptedExport(config, [], [{ id: 'e1', data: blob, createdAt: 'x', order: 0 }]);
+
+  assert.equal(file.format, EXPORT_FORMAT);
+  assert.equal(file.encrypted, true);
+  assert.equal(file.kdf.salt, config.salt);
+  assert.equal(file.kdf.iterations, config.iterations);
+
+  const wire = JSON.stringify(file);
+  assert.ok(!wire.includes('Chase Bank'), 'an encrypted export must not contain readable data');
+  assert.ok(!wire.includes('S3cr3t'), 'an encrypted export must not contain readable data');
+  assert.ok(!wire.includes(PASS), 'the passphrase must never be written to a file');
+});
+
+test('an encrypted export round-trips back to the original entries', async () => {
+  const { config, key } = await createVaultConfig(PASS, FAST);
+  const entry = { ...blankEntry(), title: 'db1', username: 'postgres', password: 'pw', groupId: 'g1' };
+  const file = buildEncryptedExport(
+    config,
+    [{ id: 'g1', data: await encryptJson(key, groupBody({ name: 'VMs', color: '#5EE6C5' }), { aad: 'g1' }), createdAt: 'x' }],
+    [{ id: 'e1', data: await encryptJson(key, entryBody(entry), { aad: 'e1' }), createdAt: 'x', order: 3 }]
+  );
+
+  const back = await readVaultExport(file, PASS);
+  assert.equal(back.entries.length, 1);
+  assert.equal(back.entries[0].title, 'db1');
+  assert.equal(back.entries[0].password, 'pw');
+  assert.equal(back.entries[0].groupId, 'g1');
+  assert.equal(back.entries[0].order, 3, 'positions survive a backup');
+  assert.equal(back.groups[0].name, 'VMs');
+  assert.deepEqual(back.skipped, []);
+});
+
+test('a backup refuses to open with the wrong passphrase', async () => {
+  const { config, key } = await createVaultConfig(PASS, FAST);
+  const file = buildEncryptedExport(config, [], [
+    { id: 'e1', data: await encryptJson(key, entryBody(blankEntry()), { aad: 'e1' }), createdAt: 'x', order: 0 }
+  ]);
+  await assert.rejects(() => readVaultExport(file, 'not the passphrase'), WrongPassphraseError);
+});
+
+test('one damaged entry is skipped rather than sinking the whole restore', async () => {
+  const { config, key } = await createVaultConfig(PASS, FAST);
+  const good = await encryptJson(key, entryBody({ ...blankEntry(), title: 'fine' }), { aad: 'e1' });
+  const file = buildEncryptedExport(config, [], [
+    { id: 'e1', data: good, createdAt: 'x', order: 0 },
+    { id: 'e2', data: { ct: 'bm90IHJlYWw=', iv: 'bm90IHJlYWxpdg==' }, createdAt: 'x', order: 1 }
+  ]);
+  const back = await readVaultExport(file, PASS);
+  assert.deepEqual(back.entries.map((e) => e.title), ['fine']);
+  assert.deepEqual(back.skipped, ['e2']);
+});
+
+test('a plaintext export is readable, says so, and resolves group names', () => {
+  const groups = [G('g1', 'Ocufii staging VMs', '1')];
+  const entries = [{ ...blankEntry(), id: 'e1', title: 'db1', password: 'pw', groupId: 'g1', order: 0 }];
+  const file = buildPlainExport(entries, groups);
+
+  assert.equal(file.encrypted, false);
+  assert.match(file.warning, /PLAINTEXT/);
+  assert.equal(file.entries[0].password, 'pw');
+  assert.equal(file.entries[0].group, 'Ocufii staging VMs', 'a group id would be useless in another tool');
+});
+
+test('a plaintext export names no group for an ungrouped entry rather than a dangling id', () => {
+  const file = buildPlainExport([{ ...blankEntry(), id: 'e1', title: 'x', groupId: 'ghost' }], []);
+  assert.equal(file.entries[0].group, '');
+});
+
+test('parse refuses anything that is not a backup', () => {
+  assert.equal(parseVaultExport('not json').ok, false);
+  assert.equal(parseVaultExport('{"format":"something-else"}').ok, false);
+  assert.equal(parseVaultExport(JSON.stringify({ format: EXPORT_FORMAT, version: EXPORT_VERSION + 9 })).ok, false);
+});
+
+test('parse refuses a plaintext export, which is not a restore source', () => {
+  const plain = buildPlainExport([], []);
+  const res = parseVaultExport(JSON.stringify(plain));
+  assert.equal(res.ok, false);
+  assert.match(res.error, /plaintext/i);
+});
+
+test('parse refuses a backup stripped of its key material', () => {
+  const broken = { format: EXPORT_FORMAT, version: 1, encrypted: true, entries: [] };
+  assert.equal(parseVaultExport(JSON.stringify(broken)).ok, false);
+});
+
+test('parse accepts a real one', async () => {
+  const { config, key } = await createVaultConfig(PASS, FAST);
+  const file = buildEncryptedExport(config, [], [
+    { id: 'e1', data: await encryptJson(key, entryBody(blankEntry()), { aad: 'e1' }), createdAt: 'x', order: 0 }
+  ]);
+  assert.equal(parseVaultExport(JSON.stringify(file)).ok, true);
+});
+
+test('exporting a vault with no config is refused rather than producing a useless file', () => {
+  assert.throws(() => buildEncryptedExport(null, [], []), /no configuration/);
+  assert.throws(() => buildEncryptedExport({ salt: 'x' }, [], []), /no configuration/);
+});
+
+test('a new entry in an untouched group keeps the list alphabetical', () => {
+  // Caught by the browser tests: handing each new entry the next position
+  // turned the vault into insertion order after the second credential.
+  const groups = [G('g1', 'VMs', '1')];
+  const untouched = [O('1', 'charlie', 0, 'g1'), O('2', 'alpha', 0, 'g1')];
+  assert.equal(nextEntryOrder(untouched, groups, 'g1'), 0);
+
+  const after = [...untouched, O('3', 'bravo', 0, 'g1')].sort(entryOrder).map((e) => e.title);
+  assert.deepEqual(after, ['alpha', 'bravo', 'charlie']);
+});
+
+test('once a group is arranged by hand, new entries go to the bottom of it', () => {
+  const groups = [G('g1', 'VMs', '1')];
+  const arranged = [O('1', 'charlie', 0, 'g1'), O('2', 'alpha', 1, 'g1')];
+  assert.equal(nextEntryOrder(arranged, groups, 'g1'), 2);
 });

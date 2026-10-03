@@ -204,11 +204,21 @@
       <button class="sheet-row" id="import-btn">
         <span>Restore from backup</span><span class="sheet-row-note">Replaces everything on every device</span>
       </button>
+      <button class="sheet-row" id="v-export-enc">
+        <span>Back up the vault</span><span class="sheet-row-note">Encrypted — needs your passphrase to restore</span>
+      </button>
+      <button class="sheet-row" id="v-restore">
+        <span>Restore the vault</span><span class="sheet-row-note">Adds to what is there, re-encrypted under your current passphrase</span>
+      </button>
+      <button class="sheet-row danger" id="v-export-plain">
+        <span>Export the vault in plain text</span><span class="sheet-row-note">Readable by anyone — for moving into a password manager</span>
+      </button>
       <button class="sheet-row danger" id="signout-btn">
         <span>Sign out</span>
       </button>
     </div>
     <input type="file" id="import-file" accept="application/json,.json" hidden>
+    <input type="file" id="v-restore-file" accept="application/json,.json" hidden>
     <p class="sheet-foot">
       The JSON backup covers the board only. Vault entries are left out on purpose —
       an export would have to be either plaintext or useless without the passphrase,
@@ -308,6 +318,23 @@
       keep credentials for “production” any more than it can see the passwords.
       Deleting a group leaves its entries in place, ungrouped.
     </p>
+  </div>
+</div>
+
+<!-- ============ masked passphrase prompt ============ -->
+<div class="ov" id="pp-ov">
+  <div class="sheet narrow">
+    <h3>Master passphrase</h3>
+    <p class="confirm-msg" id="pp-msg"></p>
+    <div class="secret-row">
+      <input type="password" id="pp-input" autocomplete="current-password" spellcheck="false"
+             autocorrect="off" autocapitalize="off" enterkeyhint="go">
+      <button class="reveal" id="pp-input-eye" type="button" aria-label="Show passphrase">show</button>
+    </div>
+    <div class="confirm-actions">
+      <button class="btn-quiet" id="pp-cancel">Cancel</button>
+      <button class="btn-primary" id="pp-ok">Continue</button>
+    </div>
   </div>
 </div>
 

@@ -30,6 +30,8 @@ import {
   createVaultConfig, unlockVault, encryptJson, decryptJson,
   blankEntry, normaliseEntry, entryBody, entryOrder,
   validateEntry, validatePassphrase, vaultSearch,
+  nextEntryOrder, planReorder,
+  buildEncryptedExport, buildPlainExport, parseVaultExport, readVaultExport,
   blankGroup, normaliseGroup, groupBody, groupOrder, groupById, validateGroup,
   countByGroup, filterByGroup, sectionsByGroup, entryGroupId,
   GROUP_PALETTE, UNGROUPED,
@@ -953,6 +955,7 @@ function lockVault(reason) {
   if (vault.idleTimer) { clearTimeout(vault.idleTimer); vault.idleTimer = null; }
   $('entry-ov').classList.remove('show');
   $('group-ov').classList.remove('show');
+  if (passResolver) settlePassphrase(null);
   $('v-group-bar').innerHTML = '';     // group names are secrets too
   $('v-search').value = '';
   clearPassphraseInputs();
@@ -1051,11 +1054,19 @@ async function saveEntry() {
   const now = new Date().toISOString();
   const existing = vault.entries.find((e) => e.id === id);
 
+  // A new entry goes to the bottom of its group. An edited one keeps the
+  // position it was dragged to, even when the edit moved it to another group —
+  // re-sorting under someone mid-edit is never what they wanted.
+  const order = existing
+    ? (existing.groupId === entry.groupId ? existing.order : nextEntryOrder(vault.entries, vault.groups, entry.groupId))
+    : nextEntryOrder(vault.entries, vault.groups, entry.groupId);
+
   try {
     const data = await encryptJson(vault.key, entryBody(entry), { aad: id });
     await setDoc(vaultRef(id), {
       v: VAULT_VERSION,
       data,
+      order,
       createdAt: existing?.createdAt || now,
       updatedAt: now
     });
@@ -1143,7 +1154,11 @@ async function delGroup(id) {
     for (const e of members) {
       const body = entryBody({ ...e, groupId: '' });
       const data = await encryptJson(vault.key, body, { aad: e.id });
-      await updateDoc(vaultRef(e.id), { data, updatedAt: new Date().toISOString() });
+      await updateDoc(vaultRef(e.id), {
+        data,
+        order: nextEntryOrder(vault.entries, vault.groups, ''),
+        updatedAt: new Date().toISOString()
+      });
     }
     await deleteDoc(groupRef(id));
     if (vault.groupFilter === id) vault.groupFilter = '';
@@ -1152,6 +1167,253 @@ async function delGroup(id) {
     console.error(err);
     toast('Could not delete the group');
   }
+}
+
+/* ---------- drag to position ---------- *
+ *
+ * Only one write per drag touches the ciphertext: the dragged entry, and only
+ * when the drop crossed into another group. Every other affected row gets a
+ * plain integer written to it, because `order` lives outside the encrypted
+ * blob. Dragging a credential down a list of thirteen VMs should not mean
+ * thirteen AES operations and thirteen full-document rewrites.
+ */
+
+let vDragId = null;
+
+async function applyReorder(sourceId, targetId, after) {
+  const plan = planReorder(vault.entries, vault.groups, sourceId, targetId, after);
+  if (!plan || !plan.positions.length) return;
+
+  try {
+    const src = vault.entries.find((e) => e.id === sourceId);
+
+    // The group change first and on its own: it is the only write that can
+    // fail in an interesting way, and doing it before the cheap ones means a
+    // failure leaves positions untouched rather than half-applied.
+    if (plan.movedToGroup !== null && src) {
+      const body = entryBody({ ...src, groupId: plan.movedToGroup });
+      const data = await encryptJson(vault.key, body, { aad: sourceId });
+      await updateDoc(vaultRef(sourceId), { data, updatedAt: new Date().toISOString() });
+    }
+
+    const batch = writeBatch(db);
+    plan.positions.forEach(({ id, order }) => batch.update(vaultRef(id), { order }));
+    await batch.commit();
+  } catch (err) {
+    console.error(err);
+    toast('Could not save the new order');
+  }
+}
+
+function wireRowDrag(row) {
+  const id = row.dataset.id;
+
+  row.addEventListener('dragstart', (e) => {
+    vDragId = id;
+    row.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    // Firefox refuses to start a drag unless something is set.
+    try { e.dataTransfer.setData('text/plain', id); } catch (_) {}
+  });
+
+  row.addEventListener('dragend', () => {
+    vDragId = null;
+    row.classList.remove('dragging');
+    document.querySelectorAll('.v-row.over-top, .v-row.over-bottom')
+      .forEach((r) => r.classList.remove('over-top', 'over-bottom'));
+  });
+
+  row.addEventListener('dragover', (e) => {
+    if (!vDragId || vDragId === id) return;
+    e.preventDefault();
+    const box = row.getBoundingClientRect();
+    const below = e.clientY > box.top + box.height / 2;
+    row.classList.toggle('over-bottom', below);
+    row.classList.toggle('over-top', !below);
+  });
+
+  row.addEventListener('dragleave', () => row.classList.remove('over-top', 'over-bottom'));
+
+  row.addEventListener('drop', (e) => {
+    e.preventDefault();
+    const after = row.classList.contains('over-bottom');
+    row.classList.remove('over-top', 'over-bottom');
+    if (!vDragId || vDragId === id) return;
+    touchVault();
+    applyReorder(vDragId, id, after);
+    vDragId = null;
+  });
+}
+
+// Dropping on a section's header moves the entry into that group, at the top.
+// Without this an empty group could never receive anything by drag.
+function wireSectionDrop(head, groupId) {
+  head.addEventListener('dragover', (e) => {
+    if (!vDragId) return;
+    e.preventDefault();
+    head.classList.add('over');
+  });
+  head.addEventListener('dragleave', () => head.classList.remove('over'));
+  head.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    head.classList.remove('over');
+    if (!vDragId) return;
+    const src = vault.entries.find((x) => x.id === vDragId);
+    const dragId = vDragId;
+    vDragId = null;
+    if (!src || entryGroupId(src, vault.groups) === groupId) return;
+    touchVault();
+
+    try {
+      const body = entryBody({ ...src, groupId });
+      const data = await encryptJson(vault.key, body, { aad: dragId });
+      await updateDoc(vaultRef(dragId), {
+        data,
+        order: nextEntryOrder(vault.entries, vault.groups, groupId),
+        updatedAt: new Date().toISOString()
+      });
+    } catch (err) { console.error(err); toast('Could not move the entry'); }
+  });
+}
+
+/* ---------- export and restore ---------- */
+
+function downloadFile(name, text, type = 'application/json') {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  a.click();
+  // Revoking frees the blob, which for a plaintext export is a copy of every
+  // credential sitting in memory. Not a real defence — the file is on disk by
+  // now — but there is no reason to keep it around either.
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+const stamp = () => new Date().toISOString().slice(0, 10);
+
+async function exportEncrypted() {
+  if (!vault.key) return;
+  try {
+    const [gSnap, eSnap] = await Promise.all([getDocs(groupsCol()), getDocs(vaultCol())]);
+    const file = buildEncryptedExport(
+      vault.config,
+      gSnap.docs.map((d) => ({ id: d.id, ...d.data() })),
+      eSnap.docs.map((d) => ({ id: d.id, ...d.data() }))
+    );
+    downloadFile(`command-deck-vault-${stamp()}.json`, JSON.stringify(file, null, 2));
+    toast('Encrypted backup downloaded', true);
+  } catch (err) {
+    console.error(err);
+    toast('Could not build the backup');
+  }
+}
+
+async function exportPlaintext() {
+  if (!vault.key) return;
+
+  const ok = await askConfirm(
+    `This writes all ${vault.entries.length} of your credentials to a file in readable form. `
+    + 'Spotlight will index it, Time Machine will copy it, and any cloud sync watching your '
+    + 'Downloads folder will upload it. Use it to move into a password manager, then delete it.',
+    'Export in plain text?'
+  );
+  if (!ok) return;
+
+  // The passphrase again, even though the vault is open. An unlocked vault on
+  // an unattended screen should not be two clicks from a complete dump.
+  const pass = await askPassphrase(
+    'Re-enter your master passphrase to export in plain text.'
+  );
+  if (pass === null) return;
+
+  try {
+    await unlockVault(pass, vault.config);
+  } catch (_) {
+    toast('That passphrase is wrong — nothing was exported');
+    return;
+  }
+
+  downloadFile(
+    `command-deck-vault-PLAINTEXT-${stamp()}.json`,
+    JSON.stringify(buildPlainExport(vault.entries, vault.groups), null, 2)
+  );
+  toast('Plaintext export downloaded — delete it when you are done', true);
+}
+
+async function restoreVault(file) {
+  if (!vault.key) return;
+  const parsed = parseVaultExport(await file.text());
+  if (!parsed.ok) { toast(parsed.error); return; }
+
+  const pass = await askPassphrase(
+    'Enter the master passphrase that backup was written with. '
+    + 'It may not be your current one.'
+  );
+  if (pass === null) return;
+
+  let opened;
+  try {
+    opened = await readVaultExport(parsed.data, pass);
+  } catch (err) {
+    toast(err instanceof WrongPassphraseError
+      ? 'That passphrase does not open the backup'
+      : `Could not read the backup: ${err?.message || err}`);
+    return;
+  }
+
+  const ok = await askConfirm(
+    `${opened.entries.length} credential${opened.entries.length === 1 ? '' : 's'} and `
+    + `${opened.groups.length} group${opened.groups.length === 1 ? '' : 's'} will be added, `
+    + 're-encrypted under your current passphrase. Anything already in the vault with the same '
+    + 'id is overwritten; everything else is left alone.'
+    + (opened.skipped.length ? ` ${opened.skipped.length} entries could not be decrypted and will be skipped.` : ''),
+    'Restore from backup?'
+  );
+  if (!ok) return;
+
+  try {
+    // Re-encrypted under the CURRENT key, one at a time rather than batched,
+    // because each needs its own encrypt call anyway and a partial restore of
+    // readable entries beats an all-or-nothing failure.
+    for (const g of opened.groups) {
+      const data = await encryptJson(vault.key, groupBody(g), { aad: g.id });
+      await setDoc(groupRef(g.id), { v: VAULT_VERSION, data, createdAt: g.createdAt || new Date().toISOString() });
+    }
+    for (const e of opened.entries) {
+      const data = await encryptJson(vault.key, entryBody(e), { aad: e.id });
+      await setDoc(vaultRef(e.id), {
+        v: VAULT_VERSION, data, order: e.order || 0,
+        createdAt: e.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      });
+    }
+    toast(`Restored ${opened.entries.length} credentials`, true);
+  } catch (err) {
+    console.error(err);
+    toast('Restore failed partway — check the console');
+  }
+}
+
+/* ---------- a passphrase prompt that is not window.prompt ---------- */
+//
+// window.prompt shows the typed text, and some browsers keep its history.
+// This is a masked field in the app's own confirm sheet.
+
+let passResolver = null;
+function askPassphrase(message) {
+  $('pp-msg').textContent = message;
+  $('pp-input').value = '';
+  $('pp-ov').classList.add('show');
+  setTimeout(() => $('pp-input').focus(), 30);
+  return new Promise((res) => { passResolver = res; });
+}
+function settlePassphrase(value) {
+  $('pp-ov').classList.remove('show');
+  const input = $('pp-input');
+  const v = value === null ? null : input.value;
+  input.value = '';
+  if (passResolver) { passResolver(v); passResolver = null; }
 }
 
 /* ---------- clipboard ---------- */
@@ -1221,6 +1483,12 @@ function renderVault() {
   // The vault follows the Google account, so a vault that "won't open" is
   // very often the wrong account rather than the wrong passphrase. Saying
   // which one is signed in costs a line and answers that before it is asked.
+  // Backup and export need the key, so they are hidden while locked rather
+  // than offered and then refused.
+  ['v-export-enc', 'v-export-plain', 'v-restore'].forEach((id) => {
+    if ($(id)) $(id).classList.toggle('hidden', !unlocked);
+  });
+
   const who = state.user?.email || state.user?.displayName || '';
   ['vs-who', 'vl-who'].forEach((id) => { if ($(id)) $(id).textContent = who ? `Signed in as ${who}` : ''; });
 
@@ -1258,7 +1526,7 @@ function renderVault() {
   $('v-list').innerHTML = grouped
     ? sectionsByGroup(shown, vault.groups).map((sec) => `
         <div class="v-section">
-          <div class="v-section-head">
+          <div class="v-section-head" data-drop-group="${sec.group ? esc(sec.group.id) : '__none__'}">
             <span class="v-dot" style="background:${sec.group ? esc(sec.group.color) : 'var(--ink-3)'}"></span>
             <span class="v-section-name">${sec.group ? esc(sec.group.name) : 'Ungrouped'}</span>
             <span class="v-section-count">${sec.entries.length}</span>
@@ -1302,10 +1570,16 @@ function renderGroupBar(entriesInScope) {
 
 function rowHtml(e) {
     const revealed = !!vault.revealed[e.id];
+    // Dragging is only meaningful against the full list. In a filtered or
+    // searched view the rows next to each other are not the rows the position
+    // is relative to, so dropping between them would mean something the person
+    // did not intend.
+    const draggable = (!vault.query && !vault.groupFilter) ? 'true' : 'false';
     const initial = esc((e.title || '?').trim().charAt(0).toUpperCase() || '?');
     const sub = e.username || e.url || '—';
     return `
-      <div class="v-row${revealed ? ' revealed' : ''}" data-id="${esc(e.id)}">
+      <div class="v-row${revealed ? ' revealed' : ''}" data-id="${esc(e.id)}" draggable="${draggable}">
+        <div class="v-grip" aria-hidden="true">${draggable === 'true' ? '⠿' : ''}</div>
         <div class="v-badge">${initial}</div>
         <div class="v-main">
           <div class="v-name">${esc(e.title)}</div>
@@ -1321,6 +1595,10 @@ function rowHtml(e) {
 }
 
 function wireVaultRows() {
+  $('v-list').querySelectorAll('.v-row[draggable="true"]').forEach(wireRowDrag);
+  $('v-list').querySelectorAll('.v-section-head[data-drop-group]')
+    .forEach((h) => wireSectionDrop(h, h.dataset.dropGroup === '__none__' ? '' : h.dataset.dropGroup));
+
   $('v-list').querySelectorAll('.v-row').forEach((row) => {
     const id = row.dataset.id;
     row.querySelectorAll('.v-act').forEach((btn) => btn.addEventListener('click', (ev) => {
@@ -1499,6 +1777,24 @@ $('e-group-save').addEventListener('click', createGroupInline);
 $('e-group-name').addEventListener('keydown', (ev) => {
   if (ev.key === 'Enter') { ev.preventDefault(); createGroupInline(); }
   if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); showInlineGroup(false); }
+});
+
+$('v-export-enc').addEventListener('click', () => { $('menu-ov').classList.remove('show'); exportEncrypted(); });
+$('v-export-plain').addEventListener('click', () => { $('menu-ov').classList.remove('show'); exportPlaintext(); });
+$('v-restore').addEventListener('click', () => { $('menu-ov').classList.remove('show'); $('v-restore-file').click(); });
+$('v-restore-file').addEventListener('change', (e) => {
+  const f = e.target.files?.[0];
+  e.target.value = '';
+  if (f) restoreVault(f);
+});
+
+wireEye('pp-input-eye');
+$('pp-ok').addEventListener('click', () => settlePassphrase(true));
+$('pp-cancel').addEventListener('click', () => settlePassphrase(null));
+$('pp-ov').addEventListener('click', (e) => { if (e.target.id === 'pp-ov') settlePassphrase(null); });
+$('pp-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); settlePassphrase(true); }
+  if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); settlePassphrase(null); }
 });
 
 $('group-x').addEventListener('click', () => $('group-ov').classList.remove('show'));

@@ -97,7 +97,12 @@ service cloud.firestore {
     function validVaultEntry() {
       let d = request.resource.data;
       return d.v is int
-          && d.keys().hasOnly(['v', 'data', 'createdAt', 'updatedAt'])
+          // `order` is a hand-chosen list position, stored outside the
+          // ciphertext so dragging a row writes an integer instead of
+          // re-encrypting every document it moved past. It says nothing
+          // about the credential, which is why it is allowed to be readable.
+          && d.keys().hasOnly(['v', 'data', 'order', 'createdAt', 'updatedAt'])
+          && (!d.keys().hasAny(['order']) || d.order is number)
           && d.data.keys().hasOnly(['ct', 'iv'])
           && d.data.ct is string && d.data.ct.size() > 0 && d.data.ct.size() <= 100000
           && d.data.iv is string && d.data.iv.size() > 0 && d.data.iv.size() <= 32

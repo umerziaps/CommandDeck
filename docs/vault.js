@@ -307,6 +307,16 @@ export function normaliseEntry(id, body, meta = {}) {
   for (const f of ENTRY_FIELDS) out[f] = typeof body?.[f] === 'string' ? body[f] : '';
   out.createdAt = typeof meta.createdAt === 'string' ? meta.createdAt : '';
   out.updatedAt = typeof meta.updatedAt === 'string' ? meta.updatedAt : out.createdAt;
+
+  // `order` sits OUTSIDE the ciphertext, on the document itself.
+  //
+  // It is a hand-chosen position, so it leaks nothing a reader does not
+  // already have: they can see how many entries exist, and the order of a
+  // list says nothing about what is in it. In exchange, dragging a row
+  // rewrites a plain integer on each affected document instead of
+  // re-encrypting every one of them. groupId stays encrypted, because the
+  // group a credential belongs to IS information about the credential.
+  out.order = typeof meta.order === 'number' && Number.isFinite(meta.order) ? meta.order : 0;
   return out;
 }
 
@@ -334,9 +344,65 @@ export function validatePassphrase(pass, confirm) {
 
 // Alphabetical by name, case-insensitively — a vault is something you look
 // things up in, not something you order by hand.
+// Hand-ordered first, then alphabetical. Every entry starts at order 0, so a
+// vault nobody has dragged is in exactly the alphabetical order it was before
+// positioning existed — the feature costs nothing until it is used.
 export const entryOrder = (a, b) =>
-  (a.title || '').localeCompare(b.title || '', undefined, { sensitivity: 'base' })
+  ((a.order || 0) - (b.order || 0))
+  || (a.title || '').localeCompare(b.title || '', undefined, { sensitivity: 'base' })
   || (a.createdAt || '').localeCompare(b.createdAt || '');
+
+/**
+ * Where a new entry lands.
+ *
+ * In a group nobody has arranged by hand, every entry sits at 0 and the list
+ * is alphabetical — so a new one gets 0 too and slots in by name. Handing it
+ * the next position instead would quietly convert the group to insertion
+ * order the moment a second credential was added, which is not an order
+ * anyone chose and not one that helps you find anything.
+ *
+ * Once a group HAS been arranged, a new entry goes to the bottom of it, where
+ * it will not disturb an order someone deliberately set.
+ */
+export function nextEntryOrder(entries, groups, groupId) {
+  const peers = entries.filter((e) => entryGroupId(e, groups) === (groupId || ''));
+  const arranged = peers.some((e) => (e.order || 0) !== 0);
+  if (!arranged) return 0;
+  return Math.max(...peers.map((e) => e.order || 0)) + 1;
+}
+
+/**
+ * Works out the new positions after dragging `sourceId` onto `targetId`.
+ *
+ * Returns only the entries whose stored position actually changes, so a drag
+ * that moves one row by one place writes two documents rather than all of
+ * them. The dragged entry's `groupId` comes back separately when the drop
+ * crossed into another group — that one needs re-encrypting, the rest do not.
+ */
+export function planReorder(entries, groups, sourceId, targetId, after = false) {
+  const src = entries.find((e) => e.id === sourceId);
+  if (!src || sourceId === targetId) return null;
+
+  const tgt = targetId ? entries.find((e) => e.id === targetId) : null;
+  const destGroup = tgt ? entryGroupId(tgt, groups) : (targetId === null ? '' : null);
+  if (destGroup === null) return null;
+
+  const ordered = entries
+    .filter((e) => entryGroupId(e, groups) === destGroup && e.id !== sourceId)
+    .sort(entryOrder);
+
+  const idx = tgt ? ordered.findIndex((e) => e.id === targetId) : -1;
+  ordered.splice(idx < 0 ? ordered.length : (after ? idx + 1 : idx), 0, src);
+
+  const moved = entryGroupId(src, groups) !== destGroup;
+  const positions = [];
+  ordered.forEach((e, n) => {
+    if ((e.order || 0) !== n) positions.push({ id: e.id, order: n });
+    else if (e.id === sourceId && moved) positions.push({ id: e.id, order: n });
+  });
+
+  return { positions, movedToGroup: moved ? destGroup : null, sourceId };
+}
 
 // Searches decrypted entries in memory. Deliberately never touches
 // `password` — typing a fragment of one password should not reveal which
@@ -537,3 +603,127 @@ export function passwordStrength(pw) {
 }
 
 export const maskSecret = (s) => '•'.repeat(Math.min(20, (s || '').length || 8));
+
+/* ---------- export and restore ---------- *
+ *
+ * Two shapes, because they answer different questions.
+ *
+ *   ENCRYPTED — the documents exactly as Firestore holds them, plus the salt
+ *   and iteration count needed to derive the key again. Safe in a Downloads
+ *   folder, a Time Machine snapshot, a Drive sync, an email to yourself. Worth
+ *   nothing to anyone without the passphrase, including you, which is the
+ *   whole point and also the whole risk.
+ *
+ *   PLAINTEXT — every credential, readable. The only form that gets you into
+ *   1Password or Bitwarden, and the only form that is dangerous the moment it
+ *   touches disk: Spotlight indexes it, Time Machine copies it, cloud sync
+ *   uploads it, and nothing about a .json file in Downloads says "this is
+ *   every password I own".
+ *
+ * So plaintext is not a convenience here. The UI makes you re-enter the master
+ * passphrase for it even when the vault is already open: a vault left unlocked
+ * on a shared screen should not be one click from a complete dump.
+ */
+
+export const EXPORT_FORMAT = 'command-deck-vault';
+export const EXPORT_VERSION = 1;
+
+export function buildEncryptedExport(config, groupDocs, entryDocs, { now } = {}) {
+  if (!config?.salt || !config?.verifier) throw new Error('This vault has no configuration to export.');
+  return {
+    format: EXPORT_FORMAT,
+    version: EXPORT_VERSION,
+    encrypted: true,
+    exportedAt: now || new Date().toISOString(),
+    // Not secrets: the salt and the round count are public inputs to PBKDF2.
+    // They are here because without them the ciphertext below is undecryptable
+    // even with the right passphrase.
+    kdf: {
+      salt: config.salt,
+      iterations: config.iterations || PBKDF2_ITERATIONS,
+      norm: config.norm || null
+    },
+    verifier: config.verifier,
+    groups: groupDocs.map((g) => ({ id: g.id, data: g.data, createdAt: g.createdAt || '' })),
+    entries: entryDocs.map((e) => ({
+      id: e.id, data: e.data, createdAt: e.createdAt || '',
+      updatedAt: e.updatedAt || '', order: typeof e.order === 'number' ? e.order : 0
+    }))
+  };
+}
+
+export function buildPlainExport(entries, groups, { now } = {}) {
+  const name = (id) => groupById(groups, id)?.name || '';
+  return {
+    format: EXPORT_FORMAT,
+    version: EXPORT_VERSION,
+    encrypted: false,
+    // Stated in the file itself, so that a copy found later on a disk explains
+    // what it is without anyone having to open and read every field.
+    warning: 'PLAINTEXT. Every credential below is readable. Delete this file once you have used it.',
+    exportedAt: now || new Date().toISOString(),
+    groups: [...groups].sort(groupOrder).map((g) => ({ name: g.name, color: g.color })),
+    entries: [...entries].sort(entryOrder).map((e) => ({
+      title: e.title, username: e.username, password: e.password,
+      url: e.url, notes: e.notes, group: name(entryGroupId(e, groups)),
+      createdAt: e.createdAt
+    }))
+  };
+}
+
+/** Parses a backup file and refuses anything that is not one. */
+export function parseVaultExport(text) {
+  let data;
+  try { data = JSON.parse(text); } catch (_) {
+    return { ok: false, error: 'That file is not valid JSON.' };
+  }
+  if (data?.format !== EXPORT_FORMAT) {
+    return { ok: false, error: 'That is not a Command Deck vault backup.' };
+  }
+  if (typeof data.version !== 'number' || data.version > EXPORT_VERSION) {
+    return { ok: false, error: `That backup was written by a newer version (v${data.version}).` };
+  }
+  if (!data.encrypted) {
+    return {
+      ok: false,
+      error: 'That is a plaintext export, not a backup. Restoring from it would put unencrypted '
+           + 'credentials through the vault; add them by hand instead.'
+    };
+  }
+  if (!data.kdf?.salt || !data.verifier?.ct) {
+    return { ok: false, error: 'That backup is missing the key material needed to read it.' };
+  }
+  if (!Array.isArray(data.entries)) {
+    return { ok: false, error: 'That backup has no entries in it.' };
+  }
+  return { ok: true, data };
+}
+
+/**
+ * Opens a backup with the passphrase it was written under.
+ *
+ * Deliberately NOT a Firestore restore. The decrypted entries come back so the
+ * caller can re-encrypt them under the CURRENT vault's key. Writing the
+ * backup's ciphertext straight back would mean importing its salt too — and
+ * then the vault's existing entries, encrypted under the old key, would all
+ * become unreadable. A restore must never cost you the entries you already had.
+ */
+export async function readVaultExport(data, passphrase, { provider } = {}) {
+  const cfg = { salt: data.kdf.salt, iterations: data.kdf.iterations, norm: data.kdf.norm, verifier: data.verifier };
+  const { key } = await unlockVault(passphrase, cfg, { provider });   // throws WrongPassphraseError
+
+  const groups = [];
+  for (const g of data.groups || []) {
+    try { groups.push(normaliseGroup(g.id, await decryptJson(key, g.data, { aad: g.id, provider }), g)); }
+    catch (_) { /* a damaged group must not sink the whole restore */ }
+  }
+
+  const entries = [];
+  const skipped = [];
+  for (const e of data.entries) {
+    try { entries.push(normaliseEntry(e.id, await decryptJson(key, e.data, { aad: e.id, provider }), e)); }
+    catch (_) { skipped.push(e.id); }
+  }
+
+  return { groups, entries, skipped };
+}
