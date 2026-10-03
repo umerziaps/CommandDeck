@@ -57,6 +57,11 @@ import {
   filterReleases, environments, appSummary, locationKind, isOpenable, shortLocation,
   parseBuildEmail, dedupeReleases, APP_PALETTE
 } from './releases.js';
+import { readEmlFile } from './eml.js';
+import {
+  validateKey as validateApiKey, listModels, pickModel, extractReleases,
+  usable as usableRelease, ClaudeError
+} from './claude.js';
 
 /* ------------------------------------------------------------------ *
  * SCHEMA — keep in lockstep with the Swift side (FirestoreItem.swift)
@@ -176,6 +181,12 @@ const state = {
   rlQuery: '',
   rlEditingId: null,
   impParsed: [],
+  impFile: null,        // { name, bytes, text } once an .eml is read
+  apEditingId: null,
+  apColor: APP_PALETTE[0],
+  apFile: null,
+  apiKey: null,         // decrypted, in memory only, while the vault is open
+  apiKeyPresent: false, // whether one is stored, known without unlocking
   expanded: {},
   collapsed: { __done__: true },
   pending: false,
@@ -220,6 +231,7 @@ const catRef   = (id) => doc(db, 'users', state.user.uid, 'categories', id);
 const vaultCol = () => collection(db, 'users', state.user.uid, 'vault');
 const vaultRef = (id) => doc(db, 'users', state.user.uid, 'vault', id);
 const vaultCfgRef = () => doc(db, 'users', state.user.uid, 'vaultMeta', 'config');
+const integrationsRef = () => doc(db, 'users', state.user.uid, 'vaultMeta', 'integrations');
 const appsCol = () => collection(db, 'users', state.user.uid, 'apps');
 const appRef = (id) => doc(db, 'users', state.user.uid, 'apps', id);
 const releasesCol = () => collection(db, 'users', state.user.uid, 'releases');
@@ -291,6 +303,7 @@ onAuthStateChanged(auth, (user) => {
 
   subscribe();
   loadVaultConfig();
+  loadApiKey();
   setView('board');
 });
 
@@ -1024,6 +1037,7 @@ async function doUnlock() {
     clearPassphraseInputs();
     startAutolock();
     subscribeVault();
+    loadApiKey();
     renderVault();
     $('v-search').focus();
   } catch (err) {
@@ -1040,6 +1054,7 @@ async function doUnlock() {
 
 function lockVault(reason) {
   vault.key = null;
+  state.apiKey = null;        // decrypted only while the vault is open
   vault.entries = [];
   vault.groups = [];
   vault.revealed = {};
@@ -2024,7 +2039,7 @@ document.addEventListener('keydown', (e) => {
     if ($('entry-ov').classList.contains('show')) closeEntry();
     if ($('ev-ov').classList.contains('show')) closeEvent();
     if ($('rl-ov').classList.contains('show')) closeRelease();
-    $('imp-ov').classList.remove('show');
+    ['imp-ov', 'apps-ov', 'key-ov'].forEach((id) => $(id).classList.remove('show'));
     $('group-ov').classList.remove('show');
   }
   if (e.key === '/' && !['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) {
@@ -2668,7 +2683,6 @@ function openRelease(id) {
   syncProdDate();
   $('rl-error').textContent = '';
   $('rl-delete').classList.toggle('hidden', !r);
-  showInlineApp(false);
   renderEnvSelect();
 
   $('rl-ov').classList.add('show');
@@ -2686,10 +2700,9 @@ function syncProdDate() {
 function closeRelease() {
   $('rl-ov').classList.remove('show');
   state.rlEditingId = null;
-  ['rl-version', 'rl-build', 'rl-envf', 'rl-changes', 'rl-source', 'rl-artifact', 'rl-notes', 'rl-app-name']
+  ['rl-version', 'rl-build', 'rl-envf', 'rl-changes', 'rl-source', 'rl-artifact', 'rl-notes']
     .forEach((id) => { $(id).value = ''; });
   $('rl-production').checked = false;
-  showInlineApp(false);
 }
 
 async function saveRelease() {
@@ -2737,67 +2750,174 @@ async function deleteRelease(id) {
 
 /* ---------- apps ---------- */
 
-function showInlineApp(show) {
-  $('rl-app-new-row').classList.toggle('hidden', !show);
-  if (show) {
-    $('rl-app-platform').innerHTML = PLATFORMS.map((p) => `<option value="${p.key}">${esc(p.label)}</option>`).join('');
-    $('rl-app-name').value = '';
-    $('rl-app-name').focus();
-  }
+/* ---------- the Claude API key ---------- *
+ *
+ * Encrypted under the vault passphrase and kept beside the vault's own config.
+ * Never in the repository: this one is public, and a key committed to a public
+ * repo is a key in a scraper's hands within minutes.
+ */
+
+async function loadApiKey() {
+  state.apiKeyPresent = false;
+  state.apiKey = null;
+  if (!state.user) return;
+  try {
+    const snap = await getDoc(integrationsRef());
+    state.apiKeyPresent = snap.exists() && !!snap.data()?.data?.ct;
+    if (state.apiKeyPresent && vault.key) {
+      const body = await decryptJson(vault.key, snap.data().data, { aad: 'integrations' });
+      state.apiKey = typeof body?.anthropicKey === 'string' ? body.anthropicKey : null;
+    }
+  } catch (err) { console.warn('Could not read the stored API key:', err); }
 }
 
-async function createAppInline(targetSelect = 'rl-app') {
-  const app = { ...blankApp(state.apps.length), name: $('rl-app-name').value.trim(), platform: $('rl-app-platform').value };
-  const check = validateApp(app, state.apps);
-  if (!check.ok) { $('rl-error').textContent = check.error; return null; }
-
-  const id = uid('app');
+async function saveApiKey(key) {
+  if (!vault.key) return { error: 'Unlock the vault first — the key is stored encrypted with it.' };
+  const check = validateApiKey(key);
+  if (!check.ok) return { error: check.error };
   try {
-    await setDoc(appRef(id), { ...appBody(app), createdAt: new Date().toISOString() });
-    $('rl-error').textContent = '';
-    showInlineApp(false);
-    fillAppSelect(targetSelect, id);
-    setTimeout(() => fillAppSelect(targetSelect, id), 400);
-    return id;
+    const data = await encryptJson(vault.key, { anthropicKey: key.trim() }, { aad: 'integrations' });
+    await setDoc(integrationsRef(), { v: VAULT_VERSION, data, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+    state.apiKey = key.trim();
+    state.apiKeyPresent = true;
+    return { ok: true };
   } catch (err) {
     console.error(err);
-    $('rl-error').textContent = `Could not create the app: ${err?.message || err}`;
-    return null;
+    return { error: `Could not save: ${err?.message || err}` };
   }
 }
 
-/* ---------- import from a build email ---------- */
+function openKeySheet() {
+  $('menu-ov').classList.remove('show');
+  $('key-input').value = '';
+  $('key-error').textContent = '';
+  hideSecretInput('key-input-eye');
+  $('key-state').textContent = !vault.key
+    ? 'The vault is locked. Unlock it to store or change the key.'
+    : state.apiKeyPresent ? 'A key is stored. Saving replaces it.' : 'No key stored yet.';
+  $('key-remove').classList.toggle('hidden', !state.apiKeyPresent);
+  $('key-ov').classList.add('show');
+  setTimeout(() => $('key-input').focus(), 30);
+}
 
-function openImport() {
+async function testApiKey() {
+  const key = $('key-input').value.trim() || state.apiKey;
+  const check = validateApiKey(key || '');
+  if (!check.ok) { $('key-error').textContent = check.error; return; }
+  $('key-error').textContent = '';
+  $('key-state').textContent = 'Checking…';
+  try {
+    const models = await listModels(key);
+    $('key-state').textContent = `Working — ${models.length} models available, extraction would use ${pickModel(models)}.`;
+  } catch (err) {
+    $('key-state').textContent = '';
+    $('key-error').textContent = err?.message || String(err);
+  }
+}
+
+/* ---------- import a build thread ---------- */
+
+function openImport(appId) {
+  resetImport();
+  fillAppSelect('imp-app', appId || state.rlApp || state.apps[0]?.id || '');
+  $('imp-ov').classList.add('show');
+}
+
+function resetImport() {
+  state.impParsed = [];
+  state.impFile = null;
   $('imp-text').value = '';
   $('imp-status').textContent = '';
   $('imp-error').textContent = '';
   $('imp-preview').innerHTML = '';
+  $('imp-ai').classList.add('hidden');
   $('imp-save').disabled = true;
-  state.impParsed = [];
-  fillAppSelect('imp-app', state.rlApp || state.apps[0]?.id || '');
-  $('imp-ov').classList.add('show');
-  setTimeout(() => $('imp-text').focus(), 30);
+  $('imp-file-row').classList.add('hidden');
 }
 
-function previewImport() {
-  const appId = $('imp-app').value;
-  if (!appId) { $('imp-error').textContent = 'Create an app first — a release has to belong to something.'; return; }
+async function takeEmlFile(file, { nameId = 'imp-file-name', sizeId = 'imp-file-size', rowId = 'imp-file-row', errId = 'imp-error' } = {}) {
+  if (!file) return null;
+  if (file.size > 25 * 1024 * 1024) {
+    $(errId).textContent = `${file.name} is ${formatBytes(file.size)} — too large to read in the browser.`;
+    return null;
+  }
+  try {
+    const res = await readEmlFile(file);
+    if (!res.ok) { $(errId).textContent = res.error || 'That file could not be read.'; return null; }
+    $(nameId).textContent = res.subject || file.name;
+    $(sizeId).textContent = formatBytes(file.size);
+    $(rowId).classList.remove('hidden');
+    $(errId).textContent = '';
+    return { name: file.name, bytes: file.size, text: res.text, subject: res.subject };
+  } catch (err) {
+    console.error(err);
+    $(errId).textContent = `Could not read that file: ${err?.message || err}`;
+    return null;
+  }
+}
 
-  const res = parseBuildEmail($('imp-text').value, { defaultDate: todayDay() });
-  if (!res.ok) {
-    $('imp-error').textContent = res.error;
-    $('imp-preview').innerHTML = '';
-    $('imp-save').disabled = true;
+function importSource() {
+  return (state.impFile?.text || '').trim() || $('imp-text').value.trim();
+}
+
+/**
+ * The template parser first, because it is free and instant for the format it
+ * knows. Claude only when that finds nothing — which is exactly the case the
+ * regex was never going to cover.
+ */
+async function readImport() {
+  const appId = $('imp-app').value;
+  if (!appId) { $('imp-error').textContent = 'Create an app first — a release has to belong to one.'; return; }
+
+  const text = importSource();
+  if (!text) { $('imp-error').textContent = 'Attach the .eml file, or paste the email text.'; return; }
+
+  $('imp-error').textContent = '';
+  $('imp-ai').classList.add('hidden');
+  $('imp-status').textContent = 'Reading…';
+
+  let parsed = [];
+  let usedClaude = false;
+  const template = parseBuildEmail(text, { defaultDate: todayDay() });
+  if (template.ok && template.releases.length) {
+    parsed = template.releases;
+  } else {
+    if (!state.apiKey) {
+      $('imp-status').textContent = '';
+      $('imp-error').textContent = state.apiKeyPresent && !vault.key
+        ? 'The built-in parser did not recognise this format. Unlock the vault so the Claude key can be used.'
+        : 'The built-in parser did not recognise this format. Add a Claude API key (⋯ menu) and it will read it instead.';
+      return;
+    }
+    try {
+      usedClaude = true;
+      const res = await extractReleases(state.apiKey, text, {
+        onProgress: ({ done, total }) => { $('imp-status').textContent = `Reading with Claude… ${done}/${total}`; }
+      });
+      parsed = res.releases.filter(usableRelease);
+      $('imp-ai').textContent = `Read by ${res.model} in ${res.calls} request${res.calls === 1 ? '' : 's'}. Check the dates and versions before importing — a model reads an unfamiliar format well, not perfectly.`;
+      $('imp-ai').classList.remove('hidden');
+      if (res.failures?.length) {
+        $('imp-error').textContent = `${res.failures.length} part(s) of the thread failed: ${res.failures[0]}`;
+      }
+    } catch (err) {
+      $('imp-status').textContent = '';
+      $('imp-error').textContent = err instanceof ClaudeError ? err.message : `Extraction failed: ${err?.message || err}`;
+      return;
+    }
+  }
+
+  if (!parsed.length) {
+    $('imp-status').textContent = '';
+    $('imp-error').textContent = 'No builds found in that email.';
     return;
   }
 
-  const { fresh, skipped } = dedupeReleases(res.releases, state.releases, appId);
-  state.impParsed = fresh.map((r) => ({ ...r, appId }));
-  $('imp-error').textContent = '';
+  const { fresh, skipped } = dedupeReleases(parsed, state.releases, appId);
+  state.impParsed = fresh.map((r) => ({ ...blankRelease(appId, todayDay()), ...r, appId }));
   $('imp-save').disabled = !fresh.length;
   $('imp-status').textContent =
-    `${res.releases.length} found · ${fresh.length} new${skipped ? ` · ${skipped} already recorded` : ''}`;
+    `${parsed.length} found${usedClaude ? ' by Claude' : ''} · ${fresh.length} new${skipped ? ` · ${skipped} already recorded` : ''}`;
 
   $('imp-preview').innerHTML = fresh.length
     ? fresh.map((r) => `
@@ -2815,10 +2935,7 @@ async function runImport() {
   $('imp-save').disabled = true;
   const now = new Date().toISOString();
   let done = 0;
-
   try {
-    // Chunked: Firestore caps a batch at 500 writes, and a backfilled thread
-    // can be long.
     for (let i = 0; i < state.impParsed.length; i += 400) {
       const batch = writeBatch(db);
       for (const r of state.impParsed.slice(i, i + 400)) {
@@ -2836,6 +2953,135 @@ async function runImport() {
   }
 }
 
+/* ---------- apps, with somewhere to live ---------- */
+
+function openApps() {
+  showAppsList();
+  $('apps-ov').classList.add('show');
+}
+
+function showAppsList() {
+  $('apps-heading').textContent = 'Apps';
+  $('apps-list-pane').classList.remove('hidden');
+  $('apps-edit-pane').classList.add('hidden');
+  state.apEditingId = null;
+  state.apFile = null;
+
+  $('apps-list').innerHTML = state.apps.length
+    ? state.apps.map((a) => {
+        const n = state.releases.filter((r) => r.appId === a.id).length;
+        return `
+          <button class="app-row" data-id="${esc(a.id)}">
+            <span class="v-dot" style="background:${esc(a.color)}"></span>
+            <span class="app-name">${esc(a.name)}</span>
+            <span class="rl-plat-tag">${esc(platformLabel(a.platform))}</span>
+            <span class="app-n">${n} release${n === 1 ? '' : 's'}</span>
+          </button>`;
+      }).join('')
+    : '<div class="tl-empty">No apps yet. Add one, and attach its build thread to fill it.</div>';
+
+  $('apps-list').querySelectorAll('.app-row').forEach((b) =>
+    b.addEventListener('click', () => showAppEditor(b.dataset.id)));
+}
+
+function showAppEditor(id) {
+  const a = id ? appById(state.apps, id) : null;
+  const src = a || blankApp(state.apps.length);
+  state.apEditingId = a ? id : null;
+  state.apColor = src.color;
+  state.apFile = null;
+
+  $('apps-heading').textContent = a ? `Edit ${a.name}` : 'New app';
+  $('apps-list-pane').classList.add('hidden');
+  $('apps-edit-pane').classList.remove('hidden');
+
+  $('ap-name').value = src.name || '';
+  $('ap-platform').innerHTML = PLATFORMS.map((p) => `<option value="${p.key}">${esc(p.label)}</option>`).join('');
+  $('ap-platform').value = src.platform;
+  $('ap-repo').value = src.repoUrl || '';
+  $('ap-artifact').value = src.artifactUrl || '';
+  $('ap-notes').value = src.notes || '';
+  $('ap-error').textContent = '';
+  $('ap-delete').classList.toggle('hidden', !a);
+  // Attaching the thread belongs to creating the app: that is the moment the
+  // history exists and nobody wants to go and find it again later.
+  $('ap-thread').classList.toggle('hidden', !!a);
+  $('ap-file-row').classList.add('hidden');
+  renderAppColors();
+  $('ap-name').focus();
+}
+
+function renderAppColors() {
+  $('ap-colors').innerHTML = APP_PALETTE.map((c) =>
+    `<button class="cat-sw${c.toLowerCase() === state.apColor.toLowerCase() ? ' on' : ''}" style="background:${c}" data-color="${c}" aria-label="Colour ${c}"></button>`).join('');
+  $('ap-colors').querySelectorAll('.cat-sw').forEach((b) => b.addEventListener('click', () => {
+    state.apColor = b.dataset.color;
+    renderAppColors();
+  }));
+}
+
+async function saveApp() {
+  const app = {
+    name: $('ap-name').value.trim(),
+    platform: $('ap-platform').value,
+    repoUrl: $('ap-repo').value.trim(),
+    artifactUrl: $('ap-artifact').value.trim(),
+    notes: $('ap-notes').value,
+    color: state.apColor
+  };
+  const check = validateApp(app, state.apps, state.apEditingId);
+  if (!check.ok) { $('ap-error').textContent = check.error; return; }
+
+  const id = state.apEditingId || uid('app');
+  const existing = appById(state.apps, id);
+  try {
+    await setDoc(appRef(id), { ...appBody(app), createdAt: existing?.createdAt || new Date().toISOString() });
+    const thread = state.apFile;
+    showAppsList();
+    toast(existing ? 'App saved' : 'App created', true);
+    // Straight into the import with the thread already loaded, rather than
+    // making someone find it again in another sheet.
+    if (!existing && thread) {
+      $('apps-ov').classList.remove('show');
+      openImport(id);
+      state.impFile = thread;
+      $('imp-file-name').textContent = thread.subject || thread.name;
+      $('imp-file-size').textContent = formatBytes(thread.bytes);
+      $('imp-file-row').classList.remove('hidden');
+      readImport();
+    }
+  } catch (err) {
+    console.error(err);
+    $('ap-error').textContent = `Could not save: ${err?.message || err}`;
+  }
+}
+
+async function deleteApp(id) {
+  const a = appById(state.apps, id);
+  const mine = state.releases.filter((r) => r.appId === id);
+  const ok = await askConfirm(
+    mine.length
+      ? `"${a?.name || 'This app'}" and its ${mine.length} release${mine.length === 1 ? '' : 's'} will be deleted. There is no undo.`
+      : `"${a?.name || 'This app'}" will be deleted.`,
+    'Delete app?'
+  );
+  if (!ok) return;
+
+  try {
+    // Releases first. A release whose app is gone renders as "Unknown app" and
+    // cannot be filtered to — orphans here are worse than a failed delete.
+    for (let i = 0; i < mine.length; i += 400) {
+      const batch = writeBatch(db);
+      mine.slice(i, i + 400).forEach((r) => batch.delete(releaseRef(r.id)));
+      await batch.commit();
+    }
+    await deleteDoc(appRef(id));
+    if (state.rlApp === id) state.rlApp = '';
+    showAppsList();
+    toast('App deleted', true);
+  } catch (err) { console.error(err); toast('Could not delete the app'); }
+}
+
 /* ---------- releases wiring ---------- */
 
 $('rl-new').addEventListener('click', () => openRelease(null));
@@ -2850,19 +3096,90 @@ $('rl-delete').addEventListener('click', () => { if (state.rlEditingId) deleteRe
 $('rl-ov').addEventListener('click', (e) => { if (e.target.id === 'rl-ov') closeRelease(); });
 $('rl-production').addEventListener('change', syncProdDate);
 
-$('rl-app-new').addEventListener('click', () => showInlineApp(true));
-$('rl-app-cancel').addEventListener('click', () => showInlineApp(false));
-$('rl-app-save').addEventListener('click', () => createAppInline('rl-app'));
-$('rl-app-name').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') { e.preventDefault(); createAppInline('rl-app'); }
-  if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); showInlineApp(false); }
-});
+// "New" in the release editor now opens the apps sheet rather than a second,
+// half-featured app form hidden inside this one.
+$('rl-app-new').addEventListener('click', () => { closeRelease(); openApps(); showAppEditor(null); });
 
-$('rl-import').addEventListener('click', openImport);
+$('rl-import').addEventListener('click', () => openImport());
+$('rl-apps').addEventListener('click', openApps);
 $('imp-x').addEventListener('click', () => $('imp-ov').classList.remove('show'));
 $('imp-cancel').addEventListener('click', () => $('imp-ov').classList.remove('show'));
 $('imp-ov').addEventListener('click', (e) => { if (e.target.id === 'imp-ov') $('imp-ov').classList.remove('show'); });
-$('imp-parse').addEventListener('click', previewImport);
-$('imp-text').addEventListener('input', () => { $('imp-save').disabled = true; $('imp-status').textContent = ''; });
-$('imp-app').addEventListener('change', () => { if ($('imp-text').value.trim()) previewImport(); });
+$('imp-parse').addEventListener('click', readImport);
 $('imp-save').addEventListener('click', runImport);
+$('imp-text').addEventListener('input', () => { $('imp-save').disabled = true; $('imp-status').textContent = ''; });
+
+$('imp-pick').addEventListener('click', () => $('imp-file').click());
+$('imp-file').addEventListener('change', async (e) => {
+  const f = e.target.files?.[0];
+  e.target.value = '';
+  if (f) { state.impFile = await takeEmlFile(f); $('imp-save').disabled = true; }
+});
+$('imp-file-clear').addEventListener('click', () => {
+  state.impFile = null;
+  $('imp-file-row').classList.add('hidden');
+  $('imp-save').disabled = true;
+});
+['dragenter', 'dragover'].forEach((t) => $('imp-drop').addEventListener(t, (e) => {
+  e.preventDefault(); $('imp-drop').classList.add('over');
+}));
+['dragleave', 'drop'].forEach((t) => $('imp-drop').addEventListener(t, () => $('imp-drop').classList.remove('over')));
+$('imp-drop').addEventListener('drop', async (e) => {
+  e.preventDefault();
+  const f = e.dataTransfer?.files?.[0];
+  if (f) { state.impFile = await takeEmlFile(f); $('imp-save').disabled = true; }
+});
+
+/* apps */
+$('apps-x').addEventListener('click', () => $('apps-ov').classList.remove('show'));
+$('apps-ov').addEventListener('click', (e) => { if (e.target.id === 'apps-ov') $('apps-ov').classList.remove('show'); });
+$('apps-add').addEventListener('click', () => showAppEditor(null));
+$('ap-cancel').addEventListener('click', showAppsList);
+$('ap-save').addEventListener('click', saveApp);
+$('ap-delete').addEventListener('click', () => { if (state.apEditingId) deleteApp(state.apEditingId); });
+$('ap-pick').addEventListener('click', () => $('ap-file').click());
+$('ap-file').addEventListener('change', async (e) => {
+  const f = e.target.files?.[0];
+  e.target.value = '';
+  if (f) state.apFile = await takeEmlFile(f,
+    { nameId: 'ap-file-name', sizeId: 'ap-file-size', rowId: 'ap-file-row', errId: 'ap-error' });
+});
+$('ap-file-clear').addEventListener('click', () => {
+  state.apFile = null;
+  $('ap-file-row').classList.add('hidden');
+});
+['dragenter', 'dragover'].forEach((t) => $('ap-drop').addEventListener(t, (e) => {
+  e.preventDefault(); $('ap-drop').classList.add('over');
+}));
+['dragleave', 'drop'].forEach((t) => $('ap-drop').addEventListener(t, () => $('ap-drop').classList.remove('over')));
+$('ap-drop').addEventListener('drop', async (e) => {
+  e.preventDefault();
+  const f = e.dataTransfer?.files?.[0];
+  if (f) state.apFile = await takeEmlFile(f,
+    { nameId: 'ap-file-name', sizeId: 'ap-file-size', rowId: 'ap-file-row', errId: 'ap-error' });
+});
+
+/* the API key */
+$('menu-key').addEventListener('click', openKeySheet);
+$('key-x').addEventListener('click', () => $('key-ov').classList.remove('show'));
+$('key-ov').addEventListener('click', (e) => { if (e.target.id === 'key-ov') $('key-ov').classList.remove('show'); });
+wireEye('key-input-eye');
+$('key-test').addEventListener('click', testApiKey);
+$('key-save').addEventListener('click', async () => {
+  const res = await saveApiKey($('key-input').value);
+  if (res.error) { $('key-error').textContent = res.error; return; }
+  $('key-input').value = '';
+  $('key-ov').classList.remove('show');
+  toast('API key saved', true);
+});
+$('key-remove').addEventListener('click', async () => {
+  const ok = await askConfirm('The stored Claude API key will be deleted.', 'Remove the key?');
+  if (!ok) return;
+  try {
+    await deleteDoc(integrationsRef());
+    state.apiKey = null;
+    state.apiKeyPresent = false;
+    $('key-ov').classList.remove('show');
+    toast('Key removed', true);
+  } catch (err) { console.error(err); $('key-error').textContent = 'Could not remove it.'; }
+});

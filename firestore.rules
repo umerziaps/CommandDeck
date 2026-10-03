@@ -65,9 +65,12 @@ service cloud.firestore {
       // client that has been tampered with — to write a vault document whose
       // body is plaintext. A document without a `data.ct` string is rejected.
 
+      // config is the vault's key material; anything else under vaultMeta is a
+      // sealed blob encrypted under the same key — the Claude API key lives
+      // here rather than anywhere it could be read.
       match /vaultMeta/{docId} {
         allow read, delete: if isOwner(userId);
-        allow create, update: if isOwner(userId) && validVaultConfig();
+        allow create, update: if isOwner(userId) && (validVaultConfig() || validVaultEntry());
       }
 
       match /vault/{entryId} {

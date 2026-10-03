@@ -228,7 +228,8 @@
       </div>
       <select id="rl-env" class="rl-env" aria-label="Environment"></select>
       <label class="gen-opt prod-only"><input type="checkbox" id="rl-prod-only"><span>Production only</span></label>
-      <button class="btn-quiet compact" id="rl-import">Paste build email</button>
+      <button class="btn-quiet compact" id="rl-apps">Apps</button>
+      <button class="btn-quiet compact" id="rl-import">Import thread</button>
       <button class="btn-primary compact" id="rl-new">New release</button>
     </div>
 
@@ -258,6 +259,9 @@
       </button>
       <button class="sheet-row" id="v-restore">
         <span>Restore the vault</span><span class="sheet-row-note">Adds to what is there, re-encrypted under your current passphrase</span>
+      </button>
+      <button class="sheet-row" id="menu-key">
+        <span>Claude API key</span><span class="sheet-row-note">For reading build emails the parser can't</span>
       </button>
       <button class="sheet-row danger" id="v-export-plain">
         <span>Export the vault in plain text</span><span class="sheet-row-note">Readable by anyone — for moving into a password manager</span>
@@ -391,13 +395,6 @@
           <input type="date" id="rl-date">
         </div>
       </div>
-      <div class="group-new-row hidden" id="rl-app-new-row">
-        <input type="text" id="rl-app-name" placeholder="Ocufii Android" autocomplete="off" maxlength="80">
-        <select id="rl-app-platform" class="rl-plat"></select>
-        <button class="btn-primary compact" id="rl-app-save" type="button">Create</button>
-        <button class="btn-quiet compact" id="rl-app-cancel" type="button">Cancel</button>
-      </div>
-
       <div class="ev-row">
         <div class="ev-col">
           <label class="vault-label" for="rl-version">Version</label>
@@ -442,25 +439,32 @@
   </div>
 </div>
 
-<!-- ============ import from a build email ============ -->
+<!-- ============ import a build thread ============ -->
 <div class="ov" id="imp-ov">
   <div class="sheet wide">
     <div class="sheet-head">
-      <h3>Paste a build email</h3>
+      <h3>Import a build thread</h3>
       <button class="sheet-x" id="imp-x" aria-label="Close">✕</button>
     </div>
     <div class="entry-form">
-      <p class="vault-lede" style="text-align:left;margin-bottom:12px">
-        Paste the whole email, replies and all. Every build announcement in the thread is read,
-        so the first paste backfills the history and later ones add just the new build.
-        Anything already recorded is skipped.
-      </p>
-
       <label class="vault-label" for="imp-app">Into which app</label>
       <select id="imp-app"></select>
 
-      <label class="vault-label" for="imp-text">The email</label>
-      <textarea id="imp-text" rows="9" spellcheck="false" placeholder="BUILD DETAILS&#10;Release: v1.3.2 (189)&#10;Environment: (California)&#10;…"></textarea>
+      <label class="vault-label">The email</label>
+      <div class="att-drop" id="imp-drop">
+        <input type="file" id="imp-file" accept=".eml,.txt,message/rfc822,text/plain" hidden>
+        <button type="button" class="btn-quiet compact" id="imp-pick">Choose .eml file</button>
+        <span class="att-hint">or drop it here · save the thread from Outlook as .eml</span>
+      </div>
+      <div class="imp-file-row hidden" id="imp-file-row">
+        <span class="n" id="imp-file-name"></span>
+        <span class="sz" id="imp-file-size"></span>
+        <button class="x" id="imp-file-clear" aria-label="Remove">✕</button>
+      </div>
+      <details class="imp-paste">
+        <summary>or paste the text instead</summary>
+        <textarea id="imp-text" rows="6" spellcheck="false" placeholder="Paste the email body…"></textarea>
+      </details>
 
       <div class="imp-actions">
         <button class="btn-quiet compact" id="imp-parse">Read it</button>
@@ -468,12 +472,115 @@
       </div>
 
       <div id="imp-preview" class="imp-preview"></div>
+      <p class="imp-ai hidden" id="imp-ai"></p>
       <p class="vault-error" id="imp-error"></p>
 
       <div class="entry-actions">
         <div class="spacer"></div>
         <button class="btn-quiet" id="imp-cancel">Cancel</button>
         <button class="btn-primary" id="imp-save" disabled>Import</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ apps ============ -->
+<div class="ov" id="apps-ov">
+  <div class="sheet wide">
+    <div class="sheet-head">
+      <h3 id="apps-heading">Apps</h3>
+      <button class="sheet-x" id="apps-x" aria-label="Close">✕</button>
+    </div>
+
+    <div id="apps-list-pane">
+      <div id="apps-list" class="apps-list"></div>
+      <div class="entry-actions">
+        <div class="spacer"></div>
+        <button class="btn-primary" id="apps-add">New app</button>
+      </div>
+    </div>
+
+    <div id="apps-edit-pane" class="entry-form hidden">
+      <div class="ev-row">
+        <div class="ev-col">
+          <label class="vault-label" for="ap-name">Name</label>
+          <input type="text" id="ap-name" placeholder="Ocufii Android" autocomplete="off" maxlength="80">
+        </div>
+        <div class="ev-col">
+          <label class="vault-label" for="ap-platform">Platform</label>
+          <select id="ap-platform"></select>
+        </div>
+      </div>
+
+      <label class="vault-label" for="ap-repo">Source code location</label>
+      <input type="text" id="ap-repo" placeholder="https://github.com/… or \\fs04\…" autocomplete="off" spellcheck="false">
+
+      <label class="vault-label" for="ap-artifact">Artifact location</label>
+      <input type="text" id="ap-artifact" placeholder="Where builds are published" autocomplete="off" spellcheck="false">
+
+      <label class="vault-label">Colour</label>
+      <div class="cat-sw-row" id="ap-colors"></div>
+
+      <label class="vault-label" for="ap-notes">Notes</label>
+      <textarea id="ap-notes" rows="3"></textarea>
+
+      <div class="ap-thread hidden" id="ap-thread">
+        <label class="vault-label">Build thread</label>
+        <div class="att-drop" id="ap-drop">
+          <input type="file" id="ap-file" accept=".eml,.txt,message/rfc822,text/plain" hidden>
+          <button type="button" class="btn-quiet compact" id="ap-pick">Attach the thread</button>
+          <span class="att-hint">optional · its builds are imported as soon as the app is created</span>
+        </div>
+        <div class="imp-file-row hidden" id="ap-file-row">
+          <span class="n" id="ap-file-name"></span>
+          <span class="sz" id="ap-file-size"></span>
+          <button class="x" id="ap-file-clear" aria-label="Remove">✕</button>
+        </div>
+      </div>
+
+      <p class="vault-error" id="ap-error"></p>
+      <div class="entry-actions">
+        <button class="btn-danger ghost" id="ap-delete">Delete</button>
+        <div class="spacer"></div>
+        <button class="btn-quiet" id="ap-cancel">Back</button>
+        <button class="btn-primary" id="ap-save">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ Claude API key ============ -->
+<div class="ov" id="key-ov">
+  <div class="sheet">
+    <div class="sheet-head">
+      <h3>Claude API key</h3>
+      <button class="sheet-x" id="key-x" aria-label="Close">✕</button>
+    </div>
+    <div class="entry-form">
+      <p class="vault-lede" style="text-align:left">
+        Used only when the built-in parser cannot read a build email. Stored encrypted
+        under your vault passphrase — never in the repository, which is public.
+        The key still sits in this browser's memory while the vault is unlocked, so use a
+        key scoped to this and nothing else.
+      </p>
+      <p class="key-note">
+        The Claude API is billed separately from a Pro subscription. Reading a thread costs
+        a fraction of a cent.
+      </p>
+
+      <div class="secret-row">
+        <input type="password" id="key-input" placeholder="sk-ant-…" autocomplete="off"
+               spellcheck="false" autocorrect="off" autocapitalize="off">
+        <button class="reveal" id="key-input-eye" type="button" aria-label="Show key">show</button>
+      </div>
+      <p class="att-hint" id="key-state"></p>
+      <p class="vault-error" id="key-error"></p>
+
+      <div class="entry-actions">
+        <button class="btn-danger ghost" id="key-remove">Remove</button>
+        <div class="spacer"></div>
+        <button class="btn-quiet" id="key-test">Test it</button>
+        <button class="btn-primary" id="key-save">Save</button>
       </div>
     </div>
   </div>

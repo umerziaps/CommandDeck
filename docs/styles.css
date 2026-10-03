@@ -804,3 +804,47 @@ html[data-theme="light"]{ --chart:#12A886; --chart-soft:rgba(18,168,134,.18); }
   .rl-date{margin-left:0;}
   .imp-row{flex-wrap:wrap; gap:6px;}
 }
+
+/* ---------- apps, import, api key ---------- */
+.apps-list{display:flex; flex-direction:column; gap:7px; margin-bottom:6px;}
+.app-row{
+  display:flex; align-items:center; gap:10px; width:100%; text-align:left;
+  background:var(--card-2); border:1px solid var(--line); border-radius:11px;
+  padding:12px 14px; cursor:pointer; color:var(--ink); font-family:inherit;
+}
+.app-row:hover{border-color:var(--accent);}
+.app-name{flex:1; min-width:0; font-size:14px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.app-n{font-family:var(--font-mono); font-size:11px; color:var(--ink-3); flex-shrink:0;}
+
+.imp-file-row{
+  display:flex; align-items:center; gap:10px; margin-top:7px;
+  background:var(--card-2); border:1px solid var(--accent); border-radius:9px; padding:9px 12px;
+}
+.imp-file-row .n{flex:1; min-width:0; font-size:12.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.imp-file-row .sz{font-family:var(--font-mono); font-size:11px; color:var(--ink-3);}
+.imp-file-row .x{background:none; border:none; color:var(--ink-3); cursor:pointer; font-size:13px; padding:2px 4px;}
+.imp-file-row .x:hover{color:var(--signal);}
+
+.imp-paste{margin-top:10px;}
+.imp-paste summary{font-size:12px; color:var(--ink-3); cursor:pointer; padding:4px 0;}
+.imp-paste summary:hover{color:var(--ink-2);}
+.imp-paste textarea{
+  width:100%; margin-top:7px; background:var(--card-2); border:1px solid var(--line-strong);
+  border-radius:10px; padding:11px 13px; color:var(--ink); font-size:13px;
+  font-family:var(--font-mono); resize:vertical;
+}
+.imp-paste textarea:focus{outline:none; border-color:var(--accent);}
+
+/* A model read it, so say so and say to check it. */
+.imp-ai{
+  font-size:11.5px; line-height:1.5; color:var(--later);
+  background:var(--card-2); border:1px solid var(--line); border-radius:9px;
+  padding:9px 11px; margin-top:10px;
+}
+.ap-thread{margin-top:6px;}
+.key-note{
+  font-size:11.5px; line-height:1.5; color:var(--waiting);
+  background:var(--card-2); border:1px solid var(--line); border-radius:9px;
+  padding:9px 11px; margin-bottom:14px;
+}
+#key-input{font-family:var(--font-mono); font-size:12.5px;}
