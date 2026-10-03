@@ -545,3 +545,30 @@ button{font-family:inherit;}
      fights the browser's own scroll. Positioning is a desktop affordance. */
   .v-grip{display:none;}
 }
+
+/* ---------- secure notes ---------- */
+.kind-tog{
+  display:flex; gap:0; background:var(--card-2); border:1px solid var(--line);
+  border-radius:10px; overflow:hidden; margin-bottom:6px;
+}
+.kind-tog button{
+  flex:1; display:inline-flex; align-items:center; justify-content:center; gap:7px;
+  background:none; border:none; padding:10px 12px; color:var(--ink-3);
+  font-size:13px; font-weight:600; cursor:pointer; transition:background .12s, color .12s;
+}
+.kind-tog button.on{background:var(--card); color:var(--accent);}
+.kind-tog svg{width:14px; height:14px;}
+
+.note-hint{font-size:11.5px; color:var(--ink-3); line-height:1.5; margin-top:5px;}
+
+.v-badge.note{color:var(--later); background:var(--card-3);}
+.v-badge.note svg{width:17px; height:17px;}
+
+/* A revealed note is prose, so it keeps its line breaks — and is capped, so a
+   long one does not push every other row off the screen. */
+.v-secret.body{
+  white-space:pre-wrap; max-height:220px; overflow:auto;
+  background:var(--card-2); border:1px solid var(--line); border-radius:9px;
+  padding:9px 11px; margin-top:6px; color:var(--ink); font-size:12.5px; line-height:1.55;
+}
+.v-row.revealed .v-badge.note{color:var(--accent);}

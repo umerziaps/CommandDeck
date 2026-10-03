@@ -25,7 +25,7 @@ import {
   plainPunctuation, hasSmartPunctuation,
   blankEntry, normaliseEntry, entryBody, entryOrder,
   blankGroup, normaliseGroup, groupBody, groupOrder, groupById, validateGroup,
-  nextEntryOrder, planReorder,
+  nextEntryOrder, planReorder, isNote, entrySecret, ENTRY_KINDS, DEFAULT_KIND,
   buildEncryptedExport, buildPlainExport, parseVaultExport, readVaultExport,
   EXPORT_FORMAT, EXPORT_VERSION,
   countByGroup, filterByGroup, sectionsByGroup, entryGroupId,
@@ -207,7 +207,7 @@ test('normaliseEntry keeps only known fields and coerces the rest to strings', (
 
 test('entryBody round-trips through normaliseEntry without gaining fields', () => {
   const body = entryBody({ ...blankEntry(), title: 'X', password: 'y', junk: 'no' });
-  assert.deepEqual(Object.keys(body).sort(), ['groupId', 'notes', 'password', 'title', 'url', 'username']);
+  assert.deepEqual(Object.keys(body).sort(), ['groupId', 'kind', 'notes', 'password', 'title', 'url', 'username']);
 });
 
 test('entries sort by name, ignoring case', () => {
@@ -829,4 +829,109 @@ test('once a group is arranged by hand, new entries go to the bottom of it', () 
   const groups = [G('g1', 'VMs', '1')];
   const arranged = [O('1', 'charlie', 0, 'g1'), O('2', 'alpha', 1, 'g1')];
   assert.equal(nextEntryOrder(arranged, groups, 'g1'), 2);
+});
+
+/* ---------- secure notes ---------- *
+ *
+ * A note is the same encrypted document as a login. What changes is which
+ * field holds the secret, and every code path that touches a secret has to
+ * agree about that — a disagreement would mean a note's body rendered in the
+ * clear, or a password treated as prose and searched.
+ */
+
+const note = (over = {}) => ({ ...blankEntry(), kind: 'note', title: 'Recovery codes', notes: 'aaa-bbb\nccc-ddd', ...over });
+const login = (over = {}) => ({ ...blankEntry(), title: 'Bank', username: 'me', password: 'pw', ...over });
+
+test('a new entry is a login unless told otherwise', () => {
+  assert.equal(blankEntry().kind, DEFAULT_KIND);
+  assert.equal(DEFAULT_KIND, 'login');
+});
+
+test('the secret of an entry depends on what kind it is', () => {
+  assert.equal(entrySecret(login()), 'pw');
+  assert.equal(entrySecret(note()), 'aaa-bbb\nccc-ddd');
+  assert.equal(entrySecret(note({ notes: '' })), '');
+  assert.equal(entrySecret(null), '');
+});
+
+test('entries written before notes existed read as logins', () => {
+  const e = normaliseEntry('e1', { title: 'old', password: 'pw' }, {});
+  assert.equal(e.kind, 'login');
+  assert.equal(entrySecret(e), 'pw');
+});
+
+test('an unrecognised kind falls back to login rather than rendering nothing', () => {
+  // Hiding a credential because a string was not recognised is worse than
+  // showing it in the wrong shape.
+  const e = normaliseEntry('e1', { title: 'x', kind: 'something-new', password: 'pw' }, {});
+  assert.equal(e.kind, 'login');
+  assert.equal(ENTRY_KINDS.includes(e.kind), true);
+});
+
+test('kind survives the encrypt/decrypt round trip', async () => {
+  const { key } = await createVaultConfig(PASS, FAST);
+  const blob = await encryptJson(key, entryBody(note()), { aad: 'n1' });
+  const back = normaliseEntry('n1', await decryptJson(key, blob, { aad: 'n1' }), {});
+  assert.equal(back.kind, 'note');
+  assert.equal(isNote(back), true);
+  assert.equal(entrySecret(back), 'aaa-bbb\nccc-ddd');
+});
+
+test('a note body never reaches storage in plain text', async () => {
+  const { key } = await createVaultConfig(PASS, FAST);
+  const blob = await encryptJson(key, entryBody(note({ notes: 'ocufii-root-recovery-7781' })), { aad: 'n1' });
+  assert.ok(!JSON.stringify(blob).includes('ocufii-root-recovery'));
+  assert.ok(!JSON.stringify(blob).includes('Recovery codes'));
+});
+
+test('a note needs a body; a login does not need a password', () => {
+  assert.equal(validateEntry(note({ notes: '   ' })).ok, false);
+  assert.equal(validateEntry(note()).ok, true);
+  // Plenty of logins are worth recording for the username alone.
+  assert.equal(validateEntry(login({ password: '' })).ok, true);
+});
+
+test('a note still needs a name', () => {
+  assert.equal(validateEntry(note({ title: '' })).ok, false);
+});
+
+test('search reads a note body but never a password', () => {
+  const entries = [
+    note({ title: 'Recovery codes', notes: 'zebra-unique-token' }),
+    login({ title: 'Bank', password: 'llama-unique-token' })
+  ];
+  assert.equal(vaultSearch(entries, 'zebra-unique-token').length, 1, 'a note body is content and should be findable');
+  assert.equal(vaultSearch(entries, 'llama-unique-token').length, 0, 'a password must never be searchable');
+});
+
+test('a plaintext export gives a note a body, not empty credential columns', () => {
+  const file = buildPlainExport([note({ id: 'n1' }), login({ id: 'e1' })], []);
+  const n = file.entries.find((e) => e.kind === 'note');
+  const l = file.entries.find((e) => e.kind === 'login');
+
+  assert.equal(n.body, 'aaa-bbb\nccc-ddd');
+  assert.equal('password' in n, false, '"no password" would misread as a login with none set');
+  assert.equal('username' in n, false);
+  assert.equal(l.password, 'pw');
+  assert.equal('body' in l, false);
+});
+
+test('a note round-trips through an encrypted backup', async () => {
+  const { config, key } = await createVaultConfig(PASS, FAST);
+  const file = buildEncryptedExport(config, [], [
+    { id: 'n1', data: await encryptJson(key, entryBody(note()), { aad: 'n1' }), createdAt: 'x', order: 0 }
+  ]);
+  const back = await readVaultExport(file, PASS);
+  assert.equal(back.entries[0].kind, 'note');
+  assert.equal(entrySecret(back.entries[0]), 'aaa-bbb\nccc-ddd');
+});
+
+test('notes and logins sort and group together, with no special casing', () => {
+  const groups = [G('g1', 'Ops', '1')];
+  const entries = [
+    note({ id: 'n1', title: 'zeta note', groupId: 'g1', order: 0 }),
+    login({ id: 'e1', title: 'alpha login', groupId: 'g1', order: 0 })
+  ];
+  const secs = sectionsByGroup(entries, groups);
+  assert.deepEqual(secs[0].entries.map((e) => e.title), ['alpha login', 'zeta note']);
 });

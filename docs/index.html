@@ -251,9 +251,21 @@
     </div>
 
     <div class="entry-form">
+      <div class="kind-tog" id="e-kind-tog" role="group" aria-label="What kind of entry">
+        <button type="button" data-kind="login" class="on">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="4" y="11" width="16" height="9" rx="2"/><path d="M8 11V7.5a4 4 0 0 1 8 0V11"/></svg>
+          Login
+        </button>
+        <button type="button" data-kind="note">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M6 3h8l5 5v13H6z"/><path d="M14 3v5h5"/><path d="M9 13h6M9 17h4"/></svg>
+          Secure note
+        </button>
+      </div>
+
       <label class="vault-label" for="e-title">Name</label>
       <input type="text" id="e-title" placeholder="Chase Bank" autocomplete="off" spellcheck="false">
 
+      <div id="e-login-fields">
       <label class="vault-label" for="e-username">Username or email</label>
       <input type="text" id="e-username" autocomplete="off" spellcheck="false">
 
@@ -275,6 +287,17 @@
       <label class="vault-label" for="e-url">Website</label>
       <input type="text" id="e-url" placeholder="chase.com" autocomplete="off" spellcheck="false" inputmode="url">
 
+      <label class="vault-label" for="e-notes">Notes</label>
+      <textarea id="e-notes" rows="3" spellcheck="false"></textarea>
+      </div><!-- /e-login-fields -->
+
+      <div id="e-note-fields" class="hidden">
+        <label class="vault-label" for="e-body">Note</label>
+        <textarea id="e-body" rows="9" spellcheck="false" autocorrect="off" autocapitalize="off"
+                  placeholder="Recovery codes, a licence key, the wording of a security answer…"></textarea>
+        <p class="note-hint">Encrypted exactly like a password. Hidden in the list until you reveal it.</p>
+      </div>
+
       <label class="vault-label" for="e-group">Group</label>
       <div class="group-pick-row">
         <select id="e-group"></select>
@@ -285,9 +308,6 @@
         <button class="btn-primary compact" id="e-group-save" type="button">Create</button>
         <button class="btn-quiet compact" id="e-group-cancel" type="button">Cancel</button>
       </div>
-
-      <label class="vault-label" for="e-notes">Notes</label>
-      <textarea id="e-notes" rows="3" spellcheck="false"></textarea>
 
       <p class="vault-error" id="e-error"></p>
       <div class="entry-actions">

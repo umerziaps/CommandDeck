@@ -30,7 +30,7 @@ import {
   createVaultConfig, unlockVault, encryptJson, decryptJson,
   blankEntry, normaliseEntry, entryBody, entryOrder,
   validateEntry, validatePassphrase, vaultSearch,
-  nextEntryOrder, planReorder,
+  nextEntryOrder, planReorder, isNote, entrySecret, DEFAULT_KIND,
   buildEncryptedExport, buildPlainExport, parseVaultExport, readVaultExport,
   blankGroup, normaliseGroup, groupBody, groupOrder, groupById, validateGroup,
   countByGroup, filterByGroup, sectionsByGroup, entryGroupId,
@@ -1037,14 +1037,27 @@ function subscribeVault() {
 async function saveEntry() {
   if (!vault.key) return;
 
-  const entry = {
-    title: $('e-title').value.trim(),
-    username: $('e-username').value.trim(),
-    password: $('e-password').value,
-    url: $('e-url').value.trim(),
-    notes: $('e-notes').value,
-    groupId: $('e-group').value || ''
-  };
+  const kind = currentKind();
+  const entry = kind === 'note'
+    // A note carries no credential fields at all. Leaving stale values behind
+    // from a login that was switched to a note would quietly keep a password
+    // in the vault under an entry whose UI no longer shows one.
+    ? {
+        title: $('e-title').value.trim(),
+        username: '', password: '', url: '',
+        notes: $('e-body').value,
+        groupId: $('e-group').value || '',
+        kind: 'note'
+      }
+    : {
+        title: $('e-title').value.trim(),
+        username: $('e-username').value.trim(),
+        password: $('e-password').value,
+        url: $('e-url').value.trim(),
+        notes: $('e-notes').value,
+        groupId: $('e-group').value || '',
+        kind: 'login'
+      };
 
   const check = validateEntry(entry);
   if (!check.ok) { $('e-error').textContent = check.error; return; }
@@ -1504,8 +1517,15 @@ function renderVault() {
   const matched = vaultSearch(vault.entries, vault.query);
   const shown = filterByGroup(matched, vault.groups, vault.groupFilter);
 
-  $('v-autolock-note').textContent = vault.entries.length
-    ? `${vault.entries.length} credential${vault.entries.length === 1 ? '' : 's'} · encrypted in this browser · locks itself after 10 minutes idle`
+  // Counted by kind: calling a recovery-codes note a "credential" is the kind
+  // of small lie that makes someone doubt the rest of the labelling.
+  const notes = vault.entries.filter(isNote).length;
+  const logins = vault.entries.length - notes;
+  const parts = [];
+  if (logins) parts.push(`${logins} credential${logins === 1 ? '' : 's'}`);
+  if (notes) parts.push(`${notes} note${notes === 1 ? '' : 's'}`);
+  $('v-autolock-note').textContent = parts.length
+    ? `${parts.join(' · ')} · encrypted in this browser · locks itself after 10 minutes idle`
     : '';
 
   renderGroupBar(matched);
@@ -1575,16 +1595,31 @@ function rowHtml(e) {
     // is relative to, so dropping between them would mean something the person
     // did not intend.
     const draggable = (!vault.query && !vault.groupFilter) ? 'true' : 'false';
-    const initial = esc((e.title || '?').trim().charAt(0).toUpperCase() || '?');
-    const sub = e.username || e.url || '—';
+    const note = isNote(e);
+    const secret = entrySecret(e);
+
+    const badge = note
+      ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3h8l5 5v13H6z"/><path d="M14 3v5h5"/><path d="M9 13h6M9 17h4"/></svg>'
+      : esc((e.title || '?').trim().charAt(0).toUpperCase() || '?');
+
+    // A note's subtitle must describe it without quoting it — the body is the
+    // secret, so a preview of the first line would defeat hiding it.
+    const lines = secret ? secret.split('\n').length : 0;
+    const sub = note
+      ? `Secure note · ${secret.length} characters${lines > 1 ? `, ${lines} lines` : ''}`
+      : (e.username || e.url || '—');
     return `
       <div class="v-row${revealed ? ' revealed' : ''}" data-id="${esc(e.id)}" draggable="${draggable}">
         <div class="v-grip" aria-hidden="true">${draggable === 'true' ? '⠿' : ''}</div>
-        <div class="v-badge">${initial}</div>
+        <div class="v-badge${note ? ' note' : ''}">${badge}</div>
         <div class="v-main">
           <div class="v-name">${esc(e.title)}</div>
           <div class="v-user">${esc(sub)}</div>
-          <div class="v-secret">${revealed ? esc(e.password || '(no password saved)') : esc(maskSecret(e.password))}</div>
+          <div class="v-secret${note ? ' body' : ''}">${
+            revealed
+              ? esc(secret || (note ? '(empty)' : '(no password saved)'))
+              : esc(maskSecret(secret))
+          }</div>
         </div>
         <div class="v-acts">
           <button class="v-act" data-act="reveal">${revealed ? 'hide' : 'show'}</button>
@@ -1610,8 +1645,9 @@ function wireVaultRows() {
         if (vault.revealed[id]) delete vault.revealed[id]; else vault.revealed[id] = true;
         renderVault();
       } else if (btn.dataset.act === 'copy') {
-        if (!e.password) { toast('No password saved on this entry'); return; }
-        copySecret(e.password, 'Password');
+        const secret = entrySecret(e);
+        if (!secret) { toast(isNote(e) ? 'This note is empty' : 'No password saved on this entry'); return; }
+        copySecret(secret, isNote(e) ? 'Note' : 'Password');
       } else {
         openEntry(id);
       }
@@ -1705,6 +1741,20 @@ function renderGroupManager() {
 
 /* ---------- entry editor ---------- */
 
+function setEntryKind(kind) {
+  const note = kind === 'note';
+  document.querySelectorAll('#e-kind-tog button')
+    .forEach((b) => b.classList.toggle('on', b.dataset.kind === kind));
+  $('e-login-fields').classList.toggle('hidden', note);
+  $('e-note-fields').classList.toggle('hidden', !note);
+  $('entry-title').textContent = vault.editingId
+    ? (note ? 'Edit note' : 'Edit credential')
+    : (note ? 'New secure note' : 'New credential');
+}
+
+const currentKind = () =>
+  document.querySelector('#e-kind-tog button.on')?.dataset.kind || DEFAULT_KIND;
+
 function openEntry(id) {
   const e = id ? vault.entries.find((x) => x.id === id) : null;
   const src = e || blankEntry();
@@ -1716,6 +1766,8 @@ function openEntry(id) {
   $('e-password').value = src.password || '';
   $('e-url').value = src.url || '';
   $('e-notes').value = src.notes || '';
+  $('e-body').value = isNote(src) ? (src.notes || '') : '';
+  setEntryKind(src.kind || DEFAULT_KIND);
   $('e-error').textContent = '';
   showInlineGroup(false);
   // A new credential created while a group is filtered lands in that group —
@@ -1733,7 +1785,9 @@ function closeEntry() {
   $('entry-ov').classList.remove('show');
   vault.editingId = null;
   // Don't leave a password in a hidden input waiting to be re-revealed.
-  ['e-title', 'e-username', 'e-password', 'e-url', 'e-notes', 'e-group-name'].forEach((id) => { $(id).value = ''; });
+  ['e-title', 'e-username', 'e-password', 'e-url', 'e-notes', 'e-body', 'e-group-name']
+    .forEach((id) => { $(id).value = ''; });
+  setEntryKind(DEFAULT_KIND);
   showInlineGroup(false);
   hideSecretInput('e-password-eye');
   paintMeter('e-meter', null, '');
@@ -1770,6 +1824,9 @@ $('e-save').addEventListener('click', () => { touchVault(); saveEntry(); });
 $('e-delete').addEventListener('click', () => { if (vault.editingId) deleteEntry(vault.editingId); });
 $('e-password').addEventListener('input', () => paintMeter('e-meter', null, $('e-password').value));
 $('entry-ov').addEventListener('click', (e) => { if (e.target.id === 'entry-ov') closeEntry(); });
+
+document.querySelectorAll('#e-kind-tog button').forEach((b) =>
+  b.addEventListener('click', () => { touchVault(); setEntryKind(b.dataset.kind); $('e-error').textContent = ''; }));
 
 $('e-group-new').addEventListener('click', () => { touchVault(); showInlineGroup(true); });
 $('e-group-cancel').addEventListener('click', () => showInlineGroup(false));

@@ -294,10 +294,31 @@ export async function unlockVault(passphrase, config, { provider } = {}) {
 // `groupId` replaced an unused `catId` placeholder. Nothing was ever written
 // into it, so there is no migration: an older entry decrypts, the unknown key
 // is dropped by normaliseEntry, and groupId defaults to '' — ungrouped.
-export const ENTRY_FIELDS = ['title', 'username', 'password', 'url', 'notes', 'groupId'];
+/* ---------- what an entry can be ---------- *
+ *
+ * Not everything worth locking up is a login. Recovery codes, a licence key,
+ * the answer you gave to a security question, the wording of an account's
+ * secret word — these have a title and a body and nothing else, and forcing
+ * them into a username/password shape means putting the real content in the
+ * notes field of a credential that has no credential in it.
+ *
+ * A note is the same document, the same encryption and the same key. Only the
+ * shape differs: `notes` holds the body and IS the secret, where a login's
+ * secret is `password`. Everything that handles a secret — reveal, copy,
+ * search, export — asks `entrySecret` rather than reaching for `.password`.
+ */
+export const ENTRY_KINDS = ['login', 'note'];
+export const DEFAULT_KIND = 'login';
+
+export const ENTRY_FIELDS = ['title', 'username', 'password', 'url', 'notes', 'groupId', 'kind'];
+
+export const isNote = (e) => e?.kind === 'note';
+
+/** The field a given entry keeps hidden. One place, so nothing can disagree. */
+export const entrySecret = (e) => (isNote(e) ? (e?.notes || '') : (e?.password || ''));
 
 export function blankEntry() {
-  return { title: '', username: '', password: '', url: '', notes: '', groupId: '' };
+  return { title: '', username: '', password: '', url: '', notes: '', groupId: '', kind: DEFAULT_KIND };
 }
 
 // Narrows whatever came back from decryption to exactly the known fields, so
@@ -305,6 +326,12 @@ export function blankEntry() {
 export function normaliseEntry(id, body, meta = {}) {
   const out = { id };
   for (const f of ENTRY_FIELDS) out[f] = typeof body?.[f] === 'string' ? body[f] : '';
+
+  // An unknown kind reads as a login rather than rendering nothing. Entries
+  // written before notes existed have no kind at all, and a vault that hides
+  // a credential because it did not recognise a string is worse than one that
+  // shows it in the wrong shape.
+  if (!ENTRY_KINDS.includes(out.kind)) out.kind = DEFAULT_KIND;
   out.createdAt = typeof meta.createdAt === 'string' ? meta.createdAt : '';
   out.updatedAt = typeof meta.updatedAt === 'string' ? meta.updatedAt : out.createdAt;
 
@@ -330,7 +357,12 @@ export function validateEntry(entry) {
   const title = (entry?.title || '').trim();
   if (!title) return { ok: false, error: 'A name is required — it is how you will find this later.' };
   if (title.length > 200) return { ok: false, error: 'That name is too long (200 characters max).' };
-  if ((entry?.notes || '').length > 20000) return { ok: false, error: 'Notes are too long (20,000 characters max).' };
+  if ((entry?.notes || '').length > 20000) return { ok: false, error: 'This is too long (20,000 characters max).' };
+  // A note with no body is an empty box with a label on it. A login without a
+  // password is not: plenty are worth recording for the username alone.
+  if (isNote(entry) && !(entry?.notes || '').trim()) {
+    return { ok: false, error: 'A secure note needs something in it.' };
+  }
   return { ok: true };
 }
 
@@ -410,8 +442,13 @@ export function planReorder(entries, groups, sourceId, targetId, after = false) 
 export function vaultSearch(entries, query) {
   const q = (query || '').trim().toLowerCase();
   if (!q) return entries;
-  return entries.filter((e) =>
-    ['title', 'username', 'url', 'notes'].some((f) => (e[f] || '').toLowerCase().includes(q)));
+  return entries.filter((e) => {
+    // A note's body is searchable: it is the content, and finding it by a
+    // phrase inside it is the point. A login's password never is — typing a
+    // fragment of one password should not reveal which entry it belongs to.
+    const fields = isNote(e) ? ['title', 'notes'] : ['title', 'username', 'url', 'notes'];
+    return fields.some((f) => (e[f] || '').toLowerCase().includes(q));
+  });
 }
 
 /* ---------- groups ---------- *
@@ -664,8 +701,15 @@ export function buildPlainExport(entries, groups, { now } = {}) {
     exportedAt: now || new Date().toISOString(),
     groups: [...groups].sort(groupOrder).map((g) => ({ name: g.name, color: g.color })),
     entries: [...entries].sort(entryOrder).map((e) => ({
-      title: e.title, username: e.username, password: e.password,
-      url: e.url, notes: e.notes, group: name(entryGroupId(e, groups)),
+      kind: e.kind || DEFAULT_KIND,
+      title: e.title,
+      // A note carries only its body. Emitting empty username/password/url
+      // columns for it would read as "this login has no password" in whatever
+      // tool opens the file next.
+      ...(isNote(e)
+        ? { body: e.notes }
+        : { username: e.username, password: e.password, url: e.url, notes: e.notes }),
+      group: name(entryGroupId(e, groups)),
       createdAt: e.createdAt
     }))
   };
