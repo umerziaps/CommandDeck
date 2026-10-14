@@ -112,3 +112,100 @@ test('board items and categories still write', async () => {
     title: 'bad bucket', bucket: 'someday', done: false, urgent: false, order: 0, subs: []
   }));
 });
+
+/* ---------- team visibility board ----------
+ *
+ * These are the rules that decide whether the migration can run at all. The
+ * client can be right about every field and still get "Missing or insufficient
+ * permissions" if the rules disagree about one of them, which is exactly what
+ * happened the first time vaultGroups shipped.
+ */
+
+const project = (over = {}) => ({
+  name: 'Ocufii 2.0', color: '#5EE6C5', createdAt: '2026-10-01T00:00:00Z', ...over
+});
+const boardProject = (over = {}) => project({
+  client: 'Internal', status: 'active', summary: 'Off AWS onto our own stack.', order: 0, ...over
+});
+const component = (over = {}) => ({
+  projectId: 'p1', name: 'Ocufii iOS', platform: 'ios', repoUrl: '', artifactUrl: '',
+  notes: '', color: '#7C89F0', order: 0, createdAt: '2026-10-01T00:00:00Z', ...over
+});
+const spec = (over = {}) => ({
+  projectId: 'p1', componentId: '', title: 'SDS Draft Specification',
+  html: '<h1>Spec</h1><p>Body.</p>', text: '# Spec\nBody.', outline: ['Spec'],
+  wordCount: 2, sourceName: 'spec.docx', version: 1, createdAt: '2026-10-01T00:00:00Z', ...over
+});
+const release = (over = {}) => ({
+  appId: 'a1', version: 'v1.0', build: '1', env: 'Sqa', changes: '', sourceUrl: '',
+  artifactUrl: '', buildDate: '2026-10-01', production: false, prodDate: '', notes: '',
+  createdAt: '2026-10-01T00:00:00Z', updatedAt: '2026-10-01T00:00:00Z', ...over
+});
+
+test('a project written by the OLD timeline code is still accepted', async () => {
+  // This is the compatibility that matters: the board added four fields and
+  // the timeline writes none of them.
+  await assertSucceeds(setDoc(doc(db(ME), `users/${ME}/projects/old`), project()));
+});
+
+test('a project written by the board, with all its fields, is accepted', async () => {
+  await assertSucceeds(setDoc(doc(db(ME), `users/${ME}/projects/p1`), boardProject()));
+});
+
+test('a project with a status nobody defined is refused', async () => {
+  await assertFails(setDoc(doc(db(ME), `users/${ME}/projects/bad1`), boardProject({ status: 'on fire' })));
+  await assertFails(setDoc(doc(db(ME), `users/${ME}/projects/bad2`), boardProject({ order: 'first' })));
+  await assertFails(setDoc(doc(db(ME), `users/${ME}/projects/bad3`), boardProject({ summary: 'x'.repeat(301) })));
+});
+
+test('a component writes exactly as the app and the migration build it', async () => {
+  await assertSucceeds(setDoc(doc(db(ME), `users/${ME}/components/c1`), component()));
+  await assertSucceeds(setDoc(doc(db(ME), `users/${ME}/components/c2`), component({ platform: 'portal' })));
+});
+
+test('a component without a project, or on a platform that does not exist, is refused', async () => {
+  await assertFails(setDoc(doc(db(ME), `users/${ME}/components/x1`), component({ projectId: '' })));
+  await assertFails(setDoc(doc(db(ME), `users/${ME}/components/x2`), component({ platform: 'watchos' })));
+  await assertFails(setDoc(doc(db(ME), `users/${ME}/components/x3`), component({ color: 'blue' })));
+  await assertFails(setDoc(doc(db(ME), `users/${ME}/components/x4`), component({ order: 'top' })));
+});
+
+test('a spec version writes, and an unnumbered one does not', async () => {
+  await assertSucceeds(setDoc(doc(db(ME), `users/${ME}/specs/s1`), spec()));
+  await assertSucceeds(setDoc(doc(db(ME), `users/${ME}/specs/s2`), spec({ componentId: 'c1', version: 2 })));
+  await assertFails(setDoc(doc(db(ME), `users/${ME}/specs/x1`), spec({ version: 0 })));
+  await assertFails(setDoc(doc(db(ME), `users/${ME}/specs/x2`), spec({ version: 1.5 })));
+  await assertFails(setDoc(doc(db(ME), `users/${ME}/specs/x3`), spec({ html: '' })));
+  await assertFails(setDoc(doc(db(ME), `users/${ME}/specs/x4`), spec({ projectId: '' })));
+  await assertFails(setDoc(doc(db(ME), `users/${ME}/specs/x5`), spec({ outline: 'Spec' })));
+});
+
+test('a spec larger than the client would ever upload is refused by the rules too', async () => {
+  await assertFails(setDoc(doc(db(ME), `users/${ME}/specs/huge`), spec({ html: 'x'.repeat(400_001) })));
+});
+
+test('the migration update — adding componentId to an existing release — is allowed', async () => {
+  await assertSucceeds(setDoc(doc(db(ME), `users/${ME}/releases/r1`), release()));
+  await assertSucceeds(updateDoc(doc(db(ME), `users/${ME}/releases/r1`), { componentId: 'c1' }));
+});
+
+test('a planned release may have no build date, and a recorded one may not', async () => {
+  await assertSucceeds(setDoc(doc(db(ME), `users/${ME}/releases/r2`), release({
+    planned: true, targetDate: '2026-12-01', status: 'building', blocker: '', buildDate: ''
+  })));
+  await assertFails(setDoc(doc(db(ME), `users/${ME}/releases/r3`), release({ buildDate: '' })));
+  await assertFails(setDoc(doc(db(ME), `users/${ME}/releases/r4`), release({
+    planned: true, targetDate: 'december', buildDate: ''
+  })));
+  await assertFails(setDoc(doc(db(ME), `users/${ME}/releases/r5`), release({
+    planned: true, targetDate: '2026-12-01', status: 'nearly', buildDate: ''
+  })));
+});
+
+test('nobody else can read my specs — they are the client\'s unreleased requirements', async () => {
+  await assertSucceeds(setDoc(doc(db(ME), `users/${ME}/specs/mine`), spec()));
+  await assertFails(getDoc(doc(db(THEM), `users/${ME}/specs/mine`)));
+  await assertFails(getDoc(doc(anon(), `users/${ME}/specs/mine`)));
+  await assertFails(setDoc(doc(db(THEM), `users/${ME}/components/theirs`), component()));
+  await assertFails(getDoc(doc(anon(), `users/${ME}/components/c1`)));
+});

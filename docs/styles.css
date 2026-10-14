@@ -848,3 +848,293 @@ html[data-theme="light"]{ --chart:#12A886; --chart-soft:rgba(18,168,134,.18); }
   padding:9px 11px; margin-bottom:14px;
 }
 #key-input{font-family:var(--font-mono); font-size:12.5px;}
+
+/* ================================================================== *
+ * TEAM VISIBILITY BOARD
+ * ================================================================== */
+
+.sheet.widest{max-width:900px;}
+
+/* The migration banner. Loud enough to be seen once, quiet enough not to
+   nag: it disappears the moment there is nothing left to bring across. */
+.vb-banner{
+  display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+  background:var(--card-2); border:1px solid var(--line-strong);
+  border-left:3px solid var(--accent); border-radius:12px;
+  padding:12px 14px; margin-bottom:16px;
+  font-size:12.5px; color:var(--ink-2); line-height:1.5;
+}
+
+.vb-list{display:flex; flex-direction:column; gap:14px;}
+
+.vb-card{
+  background:var(--card); border:1px solid var(--line);
+  border-radius:14px; padding:15px 16px;
+}
+.vb-head{display:flex; align-items:center; gap:9px; flex-wrap:wrap;}
+.vb-twist{
+  background:none; border:none; padding:0; cursor:pointer; color:var(--ink-3);
+  display:flex; width:18px; height:18px; flex:none; transition:transform .15s;
+}
+.vb-twist svg{width:18px; height:18px;}
+.vb-card.open .vb-twist{transform:rotate(90deg);}
+.vb-twist:hover{color:var(--accent);}
+.vb-name{font-family:var(--font-display); font-size:16px; letter-spacing:-.01em;}
+.vb-client{font-size:11.5px; color:var(--ink-3);}
+
+.vb-status{
+  font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.05em;
+  border:1px solid var(--line-strong); border-radius:5px; padding:2px 6px; color:var(--ink-3);
+}
+.vb-status.s-active{color:var(--accent); border-color:var(--accent);}
+.vb-status.s-paused{color:var(--ink-2);}
+
+/* Freshness is the one label allowed to shout, because a board nobody has
+   touched in a month is the failure mode this whole view has to make visible. */
+.vb-fresh{font-size:11px; color:var(--ink-3);}
+.vb-fresh.stale{color:var(--signal); font-weight:700;}
+
+.vb-summary{font-size:13px; color:var(--ink-2); line-height:1.55; margin:9px 0 0;}
+
+.vb-figures{
+  display:flex; gap:16px; flex-wrap:wrap; margin-top:11px;
+  font-size:11.5px; color:var(--ink-3);
+}
+.vb-figures b{color:var(--ink); font-family:var(--font-mono); font-size:12.5px; font-weight:600;}
+.vb-figures .quiet{color:var(--ink-3); font-style:italic;}
+
+.vb-spec{
+  display:flex; align-items:center; gap:9px; flex-wrap:wrap; margin-top:12px;
+  background:var(--card-2); border:1px solid var(--line); border-radius:10px; padding:9px 11px;
+}
+.vb-spec-k, .vb-blocked-k{
+  font-size:9.5px; font-weight:700; text-transform:uppercase; letter-spacing:.06em;
+  color:var(--ink-3); flex:none;
+}
+.vb-spec-open{
+  background:none; border:none; padding:0; cursor:pointer; text-align:left;
+  font-size:13px; font-weight:600; color:var(--ink); text-decoration:underline;
+  text-decoration-color:var(--line-strong); text-underline-offset:3px;
+}
+.vb-spec-open:hover{color:var(--accent); text-decoration-color:var(--accent);}
+.vb-spec-v{
+  font-family:var(--font-mono); font-size:10.5px; font-weight:700;
+  background:var(--accent); color:var(--accent-ink); border-radius:5px; padding:2px 6px;
+}
+.vb-spec-meta{font-size:11px; color:var(--ink-3);}
+.vb-spec.none .quiet{font-size:12.5px; color:var(--ink-3); font-style:italic;}
+
+.vb-blocked{
+  margin-top:11px; background:var(--signal-bg); border:1px solid var(--signal);
+  border-radius:10px; padding:9px 11px;
+  display:flex; flex-direction:column; gap:6px;
+}
+.vb-block-row{
+  display:flex; gap:10px; align-items:baseline; flex-wrap:wrap; background:none;
+  border:none; padding:0; cursor:pointer; text-align:left; width:100%;
+}
+.vb-block-ver{font-family:var(--font-mono); font-size:12px; font-weight:600; color:var(--signal); flex:none;}
+.vb-block-why{font-size:12px; color:var(--ink-2); line-height:1.45;}
+.vb-block-row:hover .vb-block-why{color:var(--ink);}
+
+.vb-overdue{
+  margin-top:9px; font-size:11.5px; color:var(--signal); line-height:1.5;
+}
+
+.vb-nocomp{
+  margin-top:12px; font-size:12.5px; color:var(--ink-3); line-height:1.55;
+  border-top:1px solid var(--line); padding-top:12px;
+}
+
+.vb-comps{display:flex; flex-direction:column; gap:10px; margin-top:13px;}
+.vb-comp{background:var(--card-2); border:1px solid var(--line); border-radius:11px; padding:11px 12px;}
+.vb-comp-head{display:flex; align-items:center; gap:8px; flex-wrap:wrap;}
+.vb-comp-name{font-size:13.5px; font-weight:600;}
+
+.vb-pill{
+  font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.05em;
+  border-radius:5px; padding:2px 6px;
+}
+.vb-pill.bad{background:var(--signal); color:#fff;}
+
+/* Four cells, because the four questions are the same for every component.
+   They collapse to two and then one rather than scrolling sideways. */
+.vb-comp-grid{
+  display:grid; grid-template-columns:repeat(4, minmax(0, 1fr));
+  gap:10px; margin-top:11px;
+}
+.vb-cell{display:flex; flex-direction:column; gap:3px; min-width:0;}
+.vb-cell .k{
+  font-size:9.5px; font-weight:700; text-transform:uppercase; letter-spacing:.06em;
+  color:var(--ink-3);
+}
+.vb-cell .quiet{font-size:12.5px; color:var(--ink-3); font-style:italic;}
+.vb-num{font-family:var(--font-mono); font-size:14px; font-weight:600;}
+.vb-when{font-size:10.5px; color:var(--ink-3);}
+.vb-link{
+  background:none; border:none; padding:0; cursor:pointer; text-align:left;
+  font-family:var(--font-mono); font-size:12.5px; font-weight:600; color:var(--ink);
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.vb-link:hover{color:var(--accent);}
+.vb-link.quiet-link{font-family:inherit; font-size:12px; color:var(--ink-3); font-weight:500; text-decoration:underline; text-underline-offset:3px;}
+
+@media (max-width:860px){
+  .vb-comp-grid{grid-template-columns:repeat(2, minmax(0, 1fr));}
+}
+@media (max-width:520px){
+  .vb-comp-grid{grid-template-columns:1fr;}
+  .vb-figures{gap:11px;}
+}
+
+/* ---------- specs ---------- */
+
+.sp-stat{
+  font-size:12px; color:var(--ink-2); background:var(--card-2);
+  border:1px solid var(--line); border-radius:9px; padding:9px 11px; margin-top:11px;
+}
+.sp-stat b{color:var(--ink); font-family:var(--font-mono);}
+
+.sp-diff{
+  margin-top:11px; border:1px solid var(--line); border-radius:10px;
+  overflow:hidden; max-height:280px; overflow-y:auto;
+}
+.sp-diff-head{
+  font-size:11.5px; color:var(--ink-2); background:var(--card-2);
+  padding:8px 11px; border-bottom:1px solid var(--line); position:sticky; top:0;
+}
+.sp-diff-head b{color:var(--ink);}
+.sp-row{display:flex; gap:9px; padding:5px 11px; font-size:12px; line-height:1.5;}
+.sp-row .m{font-family:var(--font-mono); font-weight:700; flex:none; width:10px;}
+.sp-row .t{min-width:0; white-space:pre-wrap; word-break:break-word;}
+.sp-row.add{background:rgba(94,230,197,.10); color:var(--ink);}
+.sp-row.add .m{color:var(--accent);}
+.sp-row.del{background:var(--signal-bg); color:var(--ink-2);}
+.sp-row.del .m{color:var(--signal);}
+.sp-row.del .t{text-decoration:line-through; text-decoration-color:var(--ink-3);}
+.sp-row.same{color:var(--ink-3);}
+.sp-gap{
+  font-size:10.5px; color:var(--ink-3); padding:4px 11px;
+  background:var(--card-2); border-top:1px solid var(--line); border-bottom:1px solid var(--line);
+}
+
+/* The prettified document. Deliberately narrow: a spec read at full window
+   width is a spec nobody finishes. */
+.spec-body{
+  margin-top:13px; font-size:13.5px; line-height:1.65; color:var(--ink);
+  max-width:72ch; overflow-wrap:break-word;
+}
+.spec-body h1, .spec-body h2, .spec-body h3, .spec-body h4{
+  font-family:var(--font-display); letter-spacing:-.01em; line-height:1.25;
+  margin:22px 0 8px;
+}
+.spec-body h1{font-size:19px;}
+.spec-body h2{font-size:16px;}
+.spec-body h3{font-size:14.5px; color:var(--ink-2);}
+.spec-body h4{font-size:13px; color:var(--ink-2); text-transform:uppercase; letter-spacing:.04em;}
+.spec-body h1:first-child, .spec-body h2:first-child{margin-top:0;}
+.spec-body p{margin:0 0 10px;}
+.spec-body ul, .spec-body ol{margin:0 0 11px 20px;}
+.spec-body li{margin-bottom:4px;}
+.spec-body li > ul, .spec-body li > ol{margin-top:4px; margin-bottom:0;}
+.spec-body strong{font-weight:700;}
+.spec-body em{font-style:italic;}
+.spec-body a{color:var(--accent); text-decoration:underline; text-underline-offset:2px;}
+.spec-body table{
+  border-collapse:collapse; width:100%; margin:0 0 14px; font-size:12.5px;
+  display:block; overflow-x:auto;
+}
+.spec-body th, .spec-body td{
+  border:1px solid var(--line); padding:7px 9px; text-align:left; vertical-align:top;
+}
+.spec-body th{background:var(--card-2); font-weight:700;}
+
+.spv-bar{
+  display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  padding-bottom:12px; border-bottom:1px solid var(--line); margin-bottom:4px;
+}
+.spv-bar select{max-width:210px;}
+.spv-meta{font-size:11px; color:var(--ink-3);}
+.spv-bar .btn-quiet.on{border-color:var(--accent); color:var(--accent);}
+
+.spv-wrap{display:grid; grid-template-columns:200px minmax(0, 1fr); gap:20px;}
+.spv-outline{
+  display:flex; flex-direction:column; gap:1px; align-self:start;
+  position:sticky; top:0; max-height:62vh; overflow-y:auto;
+  border-right:1px solid var(--line); padding-right:12px;
+}
+.spv-outline button{
+  background:none; border:none; text-align:left; cursor:pointer;
+  font-size:11.5px; color:var(--ink-3); padding:4px 0; line-height:1.4;
+}
+.spv-outline button:hover{color:var(--accent);}
+.spv-outline .quiet{font-size:11.5px; color:var(--ink-3); font-style:italic;}
+.spv-wrap .spec-body{margin-top:0;}
+
+@media (max-width:720px){
+  .spv-wrap{grid-template-columns:1fr;}
+  .spv-outline{position:static; border-right:none; border-bottom:1px solid var(--line); padding:0 0 10px; max-height:150px;}
+}
+
+/* ---------- what's live where ---------- */
+
+.lv-wrap{overflow-x:auto;}
+.lv-table{border-collapse:collapse; width:100%; font-size:12.5px;}
+.lv-table th, .lv-table td{
+  border:1px solid var(--line); padding:9px 11px; text-align:left; vertical-align:top;
+}
+.lv-table thead th{
+  background:var(--card-2); font-size:10px; font-weight:700;
+  text-transform:uppercase; letter-spacing:.06em; color:var(--ink-3);
+}
+.lv-table tbody th{font-weight:600; white-space:nowrap;}
+.lv-ver{display:block; font-family:var(--font-mono); font-size:12.5px; font-weight:600;}
+.lv-when{display:block; font-size:10.5px; color:var(--ink-3); margin-top:2px;}
+.lv-table .quiet{color:var(--ink-3);}
+
+/* ---------- migration preview ---------- */
+
+.mg-plan{
+  display:flex; flex-direction:column; gap:1px; margin-top:12px;
+  border:1px solid var(--line); border-radius:10px; overflow:hidden;
+  max-height:340px; overflow-y:auto;
+}
+.mg-row{
+  display:flex; align-items:center; gap:9px; flex-wrap:wrap;
+  padding:9px 11px; background:var(--card-2); font-size:12.5px;
+}
+.mg-row.quiet{color:var(--ink-3);}
+.mg-tag{
+  font-size:9.5px; font-weight:700; text-transform:uppercase; letter-spacing:.05em;
+  border-radius:5px; padding:2px 6px; flex:none;
+}
+.mg-tag.new{background:var(--accent); color:var(--accent-ink);}
+.mg-tag.link{background:var(--card-3); color:var(--ink-2);}
+.mg-tag.keep{background:none; border:1px solid var(--line-strong); color:var(--ink-3);}
+.mg-name{font-weight:600;}
+.mg-arrow{font-size:11px; color:var(--ink-3);}
+.mg-proj{font-size:12.5px; color:var(--ink-2);}
+.mg-warn{
+  padding:10px 11px; background:var(--signal-bg); border-top:1px solid var(--signal);
+  font-size:12px; color:var(--ink-2); line-height:1.5;
+}
+.mg-warn p{margin:0 0 5px;}
+.mg-warn p:last-child{margin:0;}
+.vb-block-comp{
+  font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.05em;
+  color:var(--ink-3); border:1px solid var(--line-strong); border-radius:4px;
+  padding:1px 5px; flex:none;
+}
+.vb-block-when{font-size:10.5px; color:var(--ink-3); margin-left:auto; flex:none;}
+/* The diff expresses document structure with weight, not with the markers
+   docx.js uses in the plain text it diffs on. */
+.sp-row.h1 .t, .sp-row.h2 .t{font-weight:700; font-size:12.5px;}
+.sp-row.h3 .t, .sp-row.h4 .t, .sp-row.h5 .t, .sp-row.h6 .t{font-weight:600;}
+.sp-row.bullet .t::before{content:'• '; color:var(--ink-3);}
+
+/* At phone width the blocker reason gets the full line rather than being
+   squeezed into a column by the target date sitting beside it. */
+@media (max-width:560px){
+  .vb-block-why{flex:1 0 100%;}
+  .vb-block-when{margin-left:0;}
+}

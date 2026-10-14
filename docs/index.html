@@ -65,6 +65,7 @@
         </button>
         <button data-view="timeline">Timeline</button>
         <button data-view="releases">Releases</button>
+        <button data-view="visibility">Visibility</button>
       </div>
       <div class="theme-tog" id="theme-tog">
         <button data-theme-set="light" title="Light" aria-label="Light theme">
@@ -237,6 +238,30 @@
     <div id="rl-summary" class="rl-summary"></div>
     <div id="rl-list" class="rl-list"></div>
   </div><!-- /releases-view -->
+
+  <!-- ============ team visibility board ============ -->
+  <div id="visibility-view" class="hidden">
+    <div class="tl-bar">
+      <div class="tl-search">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+        <input type="search" id="vb-search" placeholder="Search projects, components, specs…" autocomplete="off">
+      </div>
+      <select id="vb-status" class="rl-env" aria-label="Project status">
+        <option value="open">Active and paused</option>
+        <option value="">Everything</option>
+        <option value="active">Active only</option>
+        <option value="shipped">Shipped</option>
+        <option value="archived">Archived</option>
+      </select>
+      <button class="btn-quiet compact" id="vb-live">What's live</button>
+      <button class="btn-primary compact" id="vb-new">New project</button>
+    </div>
+
+    <!-- Only shown when there are apps that have not been brought across. -->
+    <div id="vb-migrate-bar" class="vb-banner hidden"></div>
+
+    <div id="vb-list" class="vb-list"></div>
+  </div><!-- /visibility-view -->
 </div>
 
 <!-- ============ menu sheet ============ -->
@@ -420,6 +445,16 @@
       <label class="vault-label" for="rl-artifact">Artifact location</label>
       <input type="text" id="rl-artifact" placeholder="Where the APK / AAB / bundle landed" autocomplete="off" spellcheck="false">
 
+      <!-- A planned release is one that has not been built. It shows on the
+           visibility board and nowhere else, which is why its date is a
+           target rather than a build date. -->
+      <div class="prod-row" id="rl-plan-row">
+        <label class="gen-opt"><input type="checkbox" id="rl-planned"><span>Not built yet — planned</span></label>
+        <input type="date" id="rl-target" class="hidden" aria-label="Target date">
+        <select id="rl-status" class="rl-env hidden" aria-label="Status"></select>
+      </div>
+      <input type="text" id="rl-blocker" class="hidden" placeholder="Blocked by… (shown on the board)" autocomplete="off" maxlength="500">
+
       <div class="prod-row">
         <label class="gen-opt"><input type="checkbox" id="rl-production"><span>Pushed to production</span></label>
         <input type="date" id="rl-prod-date" class="hidden" aria-label="Date it went to production">
@@ -434,6 +469,185 @@
         <div class="spacer"></div>
         <button class="btn-quiet" id="rl-cancel">Cancel</button>
         <button class="btn-primary" id="rl-save">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ project editor ============ -->
+<div class="ov" id="pj-ov">
+  <div class="sheet">
+    <div class="sheet-head">
+      <h3 id="pj-heading">New project</h3>
+      <button class="sheet-x" id="pj-x" aria-label="Close">✕</button>
+    </div>
+    <div class="entry-form">
+      <label class="vault-label" for="pj-name">Project</label>
+      <input type="text" id="pj-name" placeholder="Ocufii 2.0" autocomplete="off">
+
+      <div class="ev-row">
+        <div class="ev-col">
+          <label class="vault-label" for="pj-client">Client</label>
+          <input type="text" id="pj-client" placeholder="Who it is for" autocomplete="off">
+        </div>
+        <div class="ev-col">
+          <label class="vault-label" for="pj-status">Status</label>
+          <select id="pj-status"></select>
+        </div>
+      </div>
+
+      <label class="vault-label" for="pj-summary">One line for the card</label>
+      <input type="text" id="pj-summary" placeholder="What this project is, in a sentence." autocomplete="off" maxlength="300">
+
+      <label class="vault-label">Colour</label>
+      <div class="cat-sw-row" id="pj-colors"></div>
+
+      <p class="vault-error" id="pj-error"></p>
+      <div class="entry-actions">
+        <button class="btn-danger ghost" id="pj-delete">Delete</button>
+        <div class="spacer"></div>
+        <button class="btn-quiet" id="pj-cancel">Cancel</button>
+        <button class="btn-primary" id="pj-save">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ component editor ============ -->
+<div class="ov" id="cm-ov">
+  <div class="sheet">
+    <div class="sheet-head">
+      <h3 id="cm-heading">New component</h3>
+      <button class="sheet-x" id="cm-x" aria-label="Close">✕</button>
+    </div>
+    <div class="entry-form">
+      <div class="ev-row">
+        <div class="ev-col">
+          <label class="vault-label" for="cm-project">Project</label>
+          <select id="cm-project"></select>
+        </div>
+        <div class="ev-col">
+          <label class="vault-label" for="cm-platform">Platform</label>
+          <select id="cm-platform"></select>
+        </div>
+      </div>
+
+      <label class="vault-label" for="cm-name">Component</label>
+      <input type="text" id="cm-name" placeholder="Ocufii iOS" autocomplete="off">
+
+      <label class="vault-label" for="cm-repo">Source code location</label>
+      <input type="text" id="cm-repo" placeholder="https://github.com/… or \\fs04\…" autocomplete="off" spellcheck="false">
+
+      <label class="vault-label" for="cm-artifact">Artifact location</label>
+      <input type="text" id="cm-artifact" placeholder="Where builds land" autocomplete="off" spellcheck="false">
+
+      <label class="vault-label" for="cm-notes">Notes</label>
+      <textarea id="cm-notes" rows="3" placeholder="Signing, store IDs, anything the team asks about."></textarea>
+
+      <label class="vault-label">Colour</label>
+      <div class="cat-sw-row" id="cm-colors"></div>
+
+      <p class="vault-error" id="cm-error"></p>
+      <div class="entry-actions">
+        <button class="btn-danger ghost" id="cm-delete">Delete</button>
+        <div class="spacer"></div>
+        <button class="btn-quiet" id="cm-cancel">Cancel</button>
+        <button class="btn-primary" id="cm-save">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ upload a spec ============ -->
+<div class="ov" id="sp-ov">
+  <div class="sheet wide">
+    <div class="sheet-head">
+      <h3 id="sp-heading">Upload a spec</h3>
+      <button class="sheet-x" id="sp-x" aria-label="Close">✕</button>
+    </div>
+    <div class="entry-form">
+      <div class="ev-row">
+        <div class="ev-col">
+          <label class="vault-label" for="sp-project">Project</label>
+          <select id="sp-project"></select>
+        </div>
+        <div class="ev-col">
+          <label class="vault-label" for="sp-component">Applies to</label>
+          <select id="sp-component"></select>
+        </div>
+      </div>
+
+      <label class="vault-label" for="sp-title">Title</label>
+      <input type="text" id="sp-title" placeholder="Taken from the document" autocomplete="off" maxlength="200">
+
+      <label class="vault-label">The document</label>
+      <div class="att-drop" id="sp-drop">
+        <input type="file" id="sp-file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" hidden>
+        <button type="button" class="btn-quiet compact" id="sp-pick">Choose the .docx</button>
+        <span class="att-hint">or drop it here · read in this tab, nothing is stored until you save</span>
+      </div>
+
+      <div id="sp-stat" class="sp-stat hidden"></div>
+      <div id="sp-diff" class="sp-diff hidden"></div>
+      <div id="sp-preview" class="spec-body hidden"></div>
+
+      <p class="vault-error" id="sp-error"></p>
+      <div class="entry-actions">
+        <div class="spacer"></div>
+        <button class="btn-quiet" id="sp-cancel">Cancel</button>
+        <button class="btn-primary" id="sp-save" disabled>Save version</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ spec reader ============ -->
+<div class="ov" id="spv-ov">
+  <div class="sheet widest">
+    <div class="sheet-head">
+      <h3 id="spv-heading">Spec</h3>
+      <button class="sheet-x" id="spv-x" aria-label="Close">✕</button>
+    </div>
+    <div class="spv-bar">
+      <select id="spv-version" aria-label="Version"></select>
+      <button class="btn-quiet compact" id="spv-diff">Changes from previous</button>
+      <span class="spv-meta" id="spv-meta"></span>
+      <div class="spacer"></div>
+      <button class="btn-danger ghost compact" id="spv-delete">Delete version</button>
+    </div>
+    <div class="spv-wrap">
+      <nav class="spv-outline" id="spv-outline" aria-label="Contents"></nav>
+      <div class="spec-body" id="spv-body"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ what's live ============ -->
+<div class="ov" id="lv-ov">
+  <div class="sheet widest">
+    <div class="sheet-head">
+      <h3>What's live where</h3>
+      <button class="sheet-x" id="lv-x" aria-label="Close">✕</button>
+    </div>
+    <div class="lv-wrap" id="lv-body"></div>
+  </div>
+</div>
+
+<!-- ============ bring apps onto the board ============ -->
+<div class="ov" id="mg-ov">
+  <div class="sheet wide">
+    <div class="sheet-head">
+      <h3>Bring apps onto the board</h3>
+      <button class="sheet-x" id="mg-x" aria-label="Close">✕</button>
+    </div>
+    <div class="entry-form">
+      <p class="att-hint" id="mg-intro"></p>
+      <div id="mg-plan" class="mg-plan"></div>
+      <p class="vault-error" id="mg-error"></p>
+      <div class="entry-actions">
+        <div class="spacer"></div>
+        <button class="btn-quiet" id="mg-cancel">Cancel</button>
+        <button class="btn-primary" id="mg-run">Do it</button>
       </div>
     </div>
   </div>

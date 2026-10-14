@@ -122,6 +122,33 @@ test('filters combine: app, environment, production and text', () => {
   assert.deepEqual(filterReleases(rs, { query: 'BEACON' }).map((r) => r.version), ['c']);
 });
 
+test('a migrated release is found under either its app or its component', () => {
+  const migrated = rel({ version: 'm', appId: 'app1', componentId: 'comp1' });
+  assert.equal(filterReleases([migrated], { appId: 'app1' }).length, 1, 'the old key still finds it');
+  assert.equal(filterReleases([migrated], { appId: 'comp1' }).length, 1, 'the new key finds it too');
+  assert.equal(filterReleases([migrated], { appId: 'other' }).length, 0);
+});
+
+test('planned releases stay off the builds list unless asked for', () => {
+  const rs = [
+    rel({ version: 'shipped' }),
+    rel({ version: 'coming', planned: true, targetDate: '2026-12-01', buildDate: '' })
+  ];
+  assert.deepEqual(filterReleases(rs).map((r) => r.version), ['shipped']);
+  assert.equal(filterReleases(rs, { includePlanned: true }).length, 2);
+});
+
+test('a planned release does not inflate the built-since count', () => {
+  const rs = [
+    rel({ version: 'v1', buildDate: '2026-01-01', production: true, prodDate: '2026-01-02' }),
+    rel({ version: 'v2', buildDate: '2026-02-01' }),
+    rel({ version: 'v3', planned: true, targetDate: '2026-12-01', buildDate: '' })
+  ];
+  const s = appSummary(rs, 'app1');
+  assert.equal(s.total, 2);
+  assert.equal(s.sinceProduction, 1);
+});
+
 test('the environment list is deduplicated case-insensitively but keeps what was typed', () => {
   const envs = environments([rel({ env: 'California' }), rel({ env: 'california' }), rel({ env: 'Ohio' })]);
   assert.deepEqual(envs, ['California', 'Ohio']);
@@ -380,9 +407,46 @@ test('a release already recorded under a DIFFERENT app is not treated as a dupli
 test('releaseBody keeps exactly the stored fields', () => {
   const b = releaseBody({ ...blankRelease('app1', TODAY), version: 'v1', junk: 'no' });
   assert.deepEqual(Object.keys(b).sort(), [
-    'appId', 'artifactUrl', 'build', 'buildDate', 'changes', 'env',
-    'notes', 'prodDate', 'production', 'sourceUrl', 'version'
+    'appId', 'artifactUrl', 'blocker', 'build', 'buildDate', 'changes',
+    'componentId', 'env', 'notes', 'planned', 'prodDate', 'production',
+    'sourceUrl', 'status', 'targetDate', 'version'
   ]);
+});
+
+test('a release carries both owner keys, so neither client loses it', () => {
+  // Written before the board: only appId.
+  const old = normaliseRelease('r1', { appId: 'a1', version: 'v1', buildDate: TODAY });
+  assert.equal(old.componentId, 'a1');
+  // Written by the board: only componentId.
+  const neu = normaliseRelease('r2', { componentId: 'c1', version: 'v1', buildDate: TODAY });
+  assert.equal(neu.appId, 'c1');
+  // Migrated: both, and the stored values win.
+  const both = normaliseRelease('r3', { appId: 'a1', componentId: 'c1' });
+  assert.equal(both.appId, 'a1');
+  assert.equal(both.componentId, 'c1');
+});
+
+test('an unknown status is not stored as a guess', () => {
+  assert.equal(normaliseRelease('r', { status: 'whatever' }).status, 'whatever');
+  assert.equal(normaliseRelease('r', {}).status, '');
+  assert.equal(normaliseRelease('r', { targetDate: 'soon' }).targetDate, '');
+});
+
+test('a planned release validates on its target date, not a build date', () => {
+  const base = { appId: 'a1', version: 'v2.0', planned: true };
+  assert.equal(validateRelease({ ...base }).ok, false);
+  assert.match(validateRelease({ ...base }).error, /target date/);
+  assert.equal(validateRelease({ ...base, targetDate: '2026-12-01' }).ok, true);
+  // Planned and shipped at once is a contradiction, not a state.
+  const both = validateRelease({ ...base, targetDate: '2026-12-01', production: true });
+  assert.equal(both.ok, false);
+  assert.match(both.error, /both planned and already in production/);
+});
+
+test('a recorded release still demands its build date', () => {
+  const r = { appId: 'a1', version: 'v1', planned: false };
+  assert.equal(validateRelease(r).ok, false);
+  assert.match(validateRelease(r).error, /build date/);
 });
 
 /* ---------- tidying a human email into a changelog ---------- *

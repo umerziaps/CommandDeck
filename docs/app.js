@@ -46,7 +46,6 @@ import {
 import {
   blankEvent, normaliseEvent, eventBody, eventOrder, validateEvent,
   filterEvents, groupByMonth, monthlyDensity, countByProject,
-  blankProject, normaliseProject, validateProject, projectOrder, projectById,
   attachmentPath, validateAttachment, normaliseAttachment, formatBytes,
   attachmentKind, monthLabel, dayLabel, todayDay, isDayString,
   RANGES, PROJECT_PALETTE, UNASSIGNED, MAX_ATTACHMENTS_PER_EVENT
@@ -55,8 +54,25 @@ import {
   PLATFORMS, platformLabel, blankApp, normaliseApp, appBody, validateApp, appOrder, appById,
   blankRelease, normaliseRelease, releaseBody, validateRelease, releaseLabel, releaseOrder,
   filterReleases, environments, appSummary, locationKind, isOpenable, shortLocation,
-  parseBuildEmail, dedupeReleases, APP_PALETTE, tidyChanges, mergeNotes
+  parseBuildEmail, dedupeReleases, APP_PALETTE, tidyChanges, mergeNotes, ownsRelease
 } from './releases.js';
+// The visibility board owns the project model now: it is the same `projects`
+// collection the timeline reads, with the board's extra fields. Importing
+// these from one place is what stops a project saved on the board from losing
+// its client and status the next time the timeline writes it.
+import {
+  PROJECT_STATUSES, projectStatusLabel,
+  RELEASE_STATUSES, releaseStatus, releaseStatusLabel, releaseStatusTone, isPlanned, isLive,
+  blankProject, normaliseProject, projectBody, validateProject, projectOrder,
+  projectBoardOrder, projectById, nextProjectOrder,
+  blankComponent, normaliseComponent, componentBody, validateComponent, componentOrder,
+  componentById, componentsOf, nextComponentOrder, releasesOf,
+  normaliseSpec, specBody, validateSpec, specsOf, currentSpec, nextSpecVersion,
+  diffSpecs, diffHunks,
+  projectRollup, liveMatrix, freshness, projectTouchedAt,
+  planMigration, migrationWrites
+} from './visibility.js';
+import { readDocx } from './docx.js';
 import { readEmlFile } from './eml.js';
 import {
   validateKey as validateApiKey, listModels, pickModel, extractReleases,
@@ -188,6 +204,22 @@ const state = {
   apFile: null,
   apiKey: null,         // decrypted, in memory only, while the vault is open
   apiKeyPresent: false, // whether one is stored, known without unlocking
+
+  /* ---- team visibility board ---- */
+  components: [],
+  specs: [],
+  vbQuery: '',
+  vbStatus: 'open',     // open | '' | active | shipped | archived
+  vbOpen: {},           // projectId → expanded on the board
+  pjEditingId: null,
+  pjColor: PROJECT_PALETTE[0],
+  cmEditingId: null,
+  cmColor: PROJECT_PALETTE[0],
+  spDraft: null,        // { html, text, outline, words, sourceName } before saving
+  spvSpecId: null,
+  spvDiff: false,
+  mgPlan: null,
+
   expanded: {},
   collapsed: { __done__: true },
   pending: false,
@@ -200,6 +232,8 @@ let unsubEvents = null;
 let unsubProjects = null;
 let unsubApps = null;
 let unsubReleases = null;
+let unsubComponents = null;
+let unsubSpecs = null;
 
 // The vault's own slice of state. `key` is a non-extractable CryptoKey and
 // lives nowhere else — not localStorage, not sessionStorage, not a cookie.
@@ -243,6 +277,11 @@ const eventRef = (id) => doc(db, 'users', state.user.uid, 'events', id);
 const projectsCol = () => collection(db, 'users', state.user.uid, 'projects');
 const projectRef = (id) => doc(db, 'users', state.user.uid, 'projects', id);
 
+const componentsCol = () => collection(db, 'users', state.user.uid, 'components');
+const componentRef = (id) => doc(db, 'users', state.user.uid, 'components', id);
+const specsCol = () => collection(db, 'users', state.user.uid, 'specs');
+const specRef = (id) => doc(db, 'users', state.user.uid, 'specs', id);
+
 const groupsCol = () => collection(db, 'users', state.user.uid, 'vaultGroups');
 const groupRef = (id) => doc(db, 'users', state.user.uid, 'vaultGroups', id);
 const catOf    = (id) => state.cats.find((c) => c.id === id) || null;
@@ -282,6 +321,8 @@ onAuthStateChanged(auth, (user) => {
   if (unsubProjects) { unsubProjects(); unsubProjects = null; }
   if (unsubApps) { unsubApps(); unsubApps = null; }
   if (unsubReleases) { unsubReleases(); unsubReleases = null; }
+  if (unsubComponents) { unsubComponents(); unsubComponents = null; }
+  if (unsubSpecs) { unsubSpecs(); unsubSpecs = null; }
 
   $('boot').classList.add('hidden');
 
@@ -293,6 +334,7 @@ onAuthStateChanged(auth, (user) => {
   if (!user) {
     state.items = []; state.cats = []; state.events = []; state.projects = [];
     state.apps = []; state.releases = [];
+    state.components = []; state.specs = [];
     $('app').classList.add('hidden');
     $('gate').classList.remove('hidden');
     return;
@@ -324,6 +366,9 @@ function subscribe() {
   unsubEvents = onSnapshot(eventsCol(), (snap) => {
     state.events = snap.docs.map((d) => normaliseEvent(d.id, d.data()));
     if (currentView === 'timeline') renderTimeline();
+    // The board counts events per project and uses their timestamps for the
+    // freshness stamp, so it is stale the moment one changes.
+    if (currentView === 'visibility') renderVisibility();
   }, (err) => {
     console.error(err);
     toast('Could not read the timeline — check the Firestore rules');
@@ -332,16 +377,41 @@ function subscribe() {
   unsubProjects = onSnapshot(projectsCol(), (snap) => {
     state.projects = snap.docs.map((d) => normaliseProject(d.id, d.data())).sort(projectOrder);
     if (currentView === 'timeline') renderTimeline();
+    if (currentView === 'visibility') renderVisibility();
   }, (err) => console.error(err));
+
+  unsubComponents = onSnapshot(componentsCol(), (snap) => {
+    state.components = snap.docs.map((d) => normaliseComponent(d.id, d.data())).sort(componentOrder);
+    if (currentView === 'visibility') renderVisibility();
+    if (currentView === 'releases') renderReleases();
+  }, (err) => {
+    console.error(err);
+    toast('Could not read the board — publish the Firestore rules');
+  });
+
+  // Specs carry the whole prettified document, so this listener moves real
+  // bytes. It is still a snapshot rather than a fetch: the alternative is a
+  // board that shows a spec the client replaced an hour ago.
+  unsubSpecs = onSnapshot(specsCol(), (snap) => {
+    state.specs = snap.docs.map((d) => normaliseSpec(d.id, d.data()));
+    if (currentView === 'visibility') renderVisibility();
+    if ($('spv-ov').classList.contains('show')) renderSpecReader();
+  }, (err) => {
+    console.error(err);
+    toast('Could not read specs — publish the Firestore rules');
+  });
 
   unsubApps = onSnapshot(appsCol(), (snap) => {
     state.apps = snap.docs.map((d) => normaliseApp(d.id, d.data())).sort(appOrder);
     if (currentView === 'releases') renderReleases();
+    // The migration banner is a function of what is still only in `apps`.
+    if (currentView === 'visibility') renderVisibility();
   }, (err) => console.error(err));
 
   unsubReleases = onSnapshot(releasesCol(), (snap) => {
     state.releases = snap.docs.map((d) => normaliseRelease(d.id, d.data()));
     if (currentView === 'releases') renderReleases();
+    if (currentView === 'visibility') renderVisibility();
   }, (err) => {
     console.error(err);
     toast('Could not read releases — check the Firestore rules');
@@ -896,12 +966,14 @@ function setView(v) {
   $('vault-view').classList.toggle('hidden', v !== 'vault');
   $('timeline-view').classList.toggle('hidden', v !== 'timeline');
   $('releases-view').classList.toggle('hidden', v !== 'releases');
+  $('visibility-view').classList.toggle('hidden', v !== 'visibility');
   document.querySelectorAll('#view-tog button')
     .forEach((b) => b.classList.toggle('on', b.dataset.view === v));
 
   if (v === 'vault') { renderVault(); focusVault(); }
   else if (v === 'timeline') { renderTimeline(); $('tl-search').focus(); }
   else if (v === 'releases') { renderReleases(); $('rl-search').focus(); }
+  else if (v === 'visibility') { renderVisibility(); $('vb-search').focus(); }
   else $('cap-input').focus();
 }
 
@@ -2040,7 +2112,7 @@ document.addEventListener('keydown', (e) => {
     if ($('entry-ov').classList.contains('show')) closeEntry();
     if ($('ev-ov').classList.contains('show')) closeEvent();
     if ($('rl-ov').classList.contains('show')) closeRelease();
-    ['imp-ov', 'apps-ov', 'key-ov'].forEach((id) => $(id).classList.remove('show'));
+    ['imp-ov', 'apps-ov', 'key-ov', 'pj-ov', 'cm-ov', 'sp-ov', 'spv-ov', 'lv-ov', 'mg-ov'].forEach((id) => $(id).classList.remove('show'));
     $('group-ov').classList.remove('show');
   }
   if (e.key === '/' && !['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) {
@@ -2538,14 +2610,18 @@ function renderReleases() {
 
   // Grouped by app when looking at everything; a flat run when one app is
   // selected, because then the question is the sequence, not the grouping.
-  if (!state.rlApp && state.apps.length > 1) {
+  const owners = releaseOwners();
+  if (!state.rlApp && owners.length > 1) {
     const byApp = new Map();
     for (const r of shown) {
-      if (!byApp.has(r.appId)) byApp.set(r.appId, []);
-      byApp.get(r.appId).push(r);
+      // Group under whichever owner the release actually names, so a
+      // half-migrated database does not split one component across two groups.
+      const key = owners.find((o) => ownsRelease(r, o.id))?.id || (r.componentId || r.appId);
+      if (!byApp.has(key)) byApp.set(key, []);
+      byApp.get(key).push(r);
     }
     $('rl-list').innerHTML = [...byApp.entries()].map(([appId, rs]) => {
-      const app = appById(state.apps, appId);
+      const app = appById(owners, appId);
       return `
         <section class="rl-group">
           <div class="tl-month-head">
@@ -2573,7 +2649,8 @@ function renderReleases() {
 }
 
 function releaseHtml(r) {
-  const app = appById(state.apps, r.appId);
+  const owners = releaseOwners();
+  const app = owners.find((o) => ownsRelease(r, o.id)) || null;
   const loc = (label, value) => {
     if (!value) return '';
     const kind = locationKind(value);
@@ -2597,7 +2674,7 @@ function releaseHtml(r) {
           : '<span class="rl-notprod">not in production</span>'}
         <span class="rl-date">${esc(r.buildDate)}</span>
       </div>
-      ${!state.rlApp && state.apps.length <= 1 && app ? `<div class="tl-proj">${esc(app.name)}</div>` : ''}
+      ${!state.rlApp && owners.length <= 1 && app ? `<div class="tl-proj">${esc(app.name)}</div>` : ''}
       ${r.changes ? `<div class="rl-changes">${esc(r.changes)}</div>` : ''}
       ${(r.sourceUrl || r.artifactUrl) ? `<div class="rl-locs">${loc('source', r.sourceUrl)}${loc('artifact', r.artifactUrl)}</div>` : ''}
       ${r.notes ? `<div class="rl-notes">${esc(r.notes)}</div>` : ''}
@@ -2606,7 +2683,8 @@ function releaseHtml(r) {
 
 function renderSummary() {
   const box = $('rl-summary');
-  const apps = state.rlApp ? state.apps.filter((a) => a.id === state.rlApp) : state.apps;
+  const all = releaseOwners();
+  const apps = state.rlApp ? all.filter((a) => a.id === state.rlApp) : all;
   if (!apps.length) { box.innerHTML = ''; return; }
 
   box.innerHTML = apps.map((a) => {
@@ -2627,14 +2705,16 @@ function renderSummary() {
 
 function renderAppBar() {
   const bar = $('rl-app-bar');
-  if (!state.apps.length) { bar.innerHTML = ''; return; }
+  const owners = releaseOwners();
+  if (!owners.length) { bar.innerHTML = ''; return; }
+  const built = state.releases.filter((r) => r.planned !== true);
   const chip = (id, label, color, n) => `
     <button class="group-chip${state.rlApp === id ? ' on' : ''}" data-app="${esc(id)}">
       ${color ? `<span class="v-dot" style="background:${esc(color)}"></span>` : ''}
       ${esc(label)}<span class="group-chip-n">${n}</span>
     </button>`;
-  bar.innerHTML = chip('', 'All', '', state.releases.length)
-    + state.apps.map((a) => chip(a.id, a.name, a.color, state.releases.filter((r) => r.appId === a.id).length)).join('');
+  bar.innerHTML = chip('', 'All', '', built.length)
+    + owners.map((a) => chip(a.id, a.name, a.color, built.filter((r) => ownsRelease(r, a.id)).length)).join('');
   bar.querySelectorAll('[data-app]').forEach((b) => b.addEventListener('click', () => {
     state.rlApp = b.dataset.app;
     renderReleases();
@@ -2657,20 +2737,54 @@ async function copyPlain(text, label) {
 
 /* ---------- editor ---------- */
 
-function fillAppSelect(selectId, selected) {
-  const sel = $(selectId);
-  sel.innerHTML = state.apps.map((a) => `<option value="${esc(a.id)}">${esc(a.name)}</option>`).join('')
-    || '<option value="">No apps yet</option>';
-  if (selected && state.apps.some((a) => a.id === selected)) sel.value = selected;
+/**
+ * Who a release can belong to.
+ *
+ * Once the board has components, they are the owners: `apps` is left in place
+ * but no longer offered, so there is one list rather than two that drift. Each
+ * entry is {id, name, color} whichever collection it came from, and a
+ * component's name is prefixed with its project when that is not obvious.
+ */
+function releaseOwners() {
+  if (!state.components.length) return state.apps;
+  return state.components.map((c) => {
+    const p = projectById(state.projects, c.projectId);
+    const sameName = p && c.name.toLowerCase().startsWith(p.name.toLowerCase());
+    return {
+      id: c.id,
+      name: p && !sameName ? `${p.name} · ${c.name}` : c.name,
+      color: c.color,
+      platform: c.platform
+    };
+  });
 }
 
-function openRelease(id) {
+function fillAppSelect(selectId, selected) {
+  const sel = $(selectId);
+  const list = releaseOwners();
+  sel.innerHTML = list.map((a) => `<option value="${esc(a.id)}">${esc(a.name)}</option>`).join('')
+    || '<option value="">Nothing to record against yet</option>';
+  if (selected && list.some((a) => a.id === selected)) sel.value = selected;
+}
+
+function openRelease(id, preset = {}) {
   const r = id ? state.releases.find((x) => x.id === id) : null;
-  const src = r || blankRelease(state.rlApp || state.apps[0]?.id || '', todayDay());
+  const owners = releaseOwners();
+  const src = r || {
+    ...blankRelease(preset.ownerId || state.rlApp || owners[0]?.id || '', todayDay()),
+    ...preset
+  };
   state.rlEditingId = r ? id : null;
 
-  $('rl-heading').textContent = r ? `Edit ${releaseLabel(r)}` : 'New release';
-  fillAppSelect('rl-app', src.appId);
+  $('rl-heading').textContent = r
+    ? `Edit ${releaseLabel(r)}`
+    : (preset.planned ? 'Plan a release' : 'New release');
+  fillAppSelect('rl-app', src.componentId || src.appId);
+  fillStatusSelect(src.status);
+  $('rl-planned').checked = src.planned === true;
+  $('rl-target').value = src.targetDate || '';
+  $('rl-blocker').value = src.blocker || '';
+  syncPlanned();
   $('rl-date').value = isDayString(src.buildDate) ? src.buildDate : todayDay();
   $('rl-version').value = src.version || '';
   $('rl-build').value = src.build || '';
@@ -2698,26 +2812,69 @@ function syncProdDate() {
   if (on && !$('rl-prod-date').value) $('rl-prod-date').value = todayDay();
 }
 
+function fillStatusSelect(selected) {
+  const sel = $('rl-status');
+  const want = RELEASE_STATUSES
+    .filter((s) => s.key !== 'live')     // "live" is the production checkbox
+    .map((s) => `<option value="${esc(s.key)}">${esc(s.label)}</option>`).join('');
+  if (sel.innerHTML !== want) sel.innerHTML = want;
+  sel.value = RELEASE_STATUSES.some((s) => s.key === selected) ? selected : 'planned';
+}
+
+/**
+ * A planned release has no build date and cannot be in production — it has
+ * not happened. Hiding those controls rather than letting them contradict the
+ * flag is the difference between a board you trust and one you check.
+ */
+function syncPlanned() {
+  const on = $('rl-planned').checked;
+  $('rl-target').classList.toggle('hidden', !on);
+  $('rl-status').classList.toggle('hidden', !on);
+  $('rl-blocker').classList.toggle('hidden', !on);
+  $('rl-date').disabled = on;
+  $('rl-production').disabled = on;
+  if (on) {
+    $('rl-production').checked = false;
+    if (!$('rl-target').value) $('rl-target').value = todayDay();
+  }
+  syncProdDate();
+}
+
 function closeRelease() {
   $('rl-ov').classList.remove('show');
   state.rlEditingId = null;
-  ['rl-version', 'rl-build', 'rl-envf', 'rl-changes', 'rl-source', 'rl-artifact', 'rl-notes']
+  ['rl-version', 'rl-build', 'rl-envf', 'rl-changes', 'rl-source', 'rl-artifact', 'rl-notes',
+   'rl-blocker', 'rl-target']
     .forEach((id) => { $(id).value = ''; });
   $('rl-production').checked = false;
+  $('rl-planned').checked = false;
+  syncPlanned();
 }
 
 async function saveRelease() {
+  const planned = $('rl-planned').checked;
+  const owner = $('rl-app').value || '';
+  const existingDoc = state.rlEditingId
+    ? state.releases.find((x) => x.id === state.rlEditingId)
+    : null;
   const r = {
-    appId: $('rl-app').value || '',
+    // A release the board created owns only `componentId`; a migrated one keeps
+    // the `appId` it was written with so an un-reloaded client still finds it.
+    appId: existingDoc?.appId || owner,
+    componentId: state.components.some((c) => c.id === owner) ? owner : (existingDoc?.componentId || owner),
+    planned,
+    targetDate: planned ? $('rl-target').value : '',
+    status: planned ? $('rl-status').value : '',
+    blocker: planned ? $('rl-blocker').value.trim() : '',
     version: $('rl-version').value.trim(),
     build: $('rl-build').value.trim(),
     env: $('rl-envf').value.trim(),
     changes: $('rl-changes').value,
     sourceUrl: $('rl-source').value.trim(),
     artifactUrl: $('rl-artifact').value.trim(),
-    buildDate: $('rl-date').value,
-    production: $('rl-production').checked,
-    prodDate: $('rl-prod-date').value,
+    buildDate: planned ? '' : $('rl-date').value,
+    production: !planned && $('rl-production').checked,
+    prodDate: planned ? '' : $('rl-prod-date').value,
     notes: $('rl-notes').value
   };
 
@@ -2734,7 +2891,7 @@ async function saveRelease() {
       updatedAt: now
     });
     closeRelease();
-    toast(existing ? 'Release saved' : 'Release recorded', true);
+    toast(existing ? 'Release saved' : (planned ? 'Release planned' : 'Release recorded'), true);
   } catch (err) {
     console.error(err);
     $('rl-error').textContent = `Could not save: ${err?.message || err}`;
@@ -2820,7 +2977,7 @@ async function testApiKey() {
 
 function openImport(appId) {
   resetImport();
-  fillAppSelect('imp-app', appId || state.rlApp || state.apps[0]?.id || '');
+  fillAppSelect('imp-app', appId || state.rlApp || releaseOwners()[0]?.id || '');
   $('imp-ov').classList.add('show');
 }
 
@@ -3218,3 +3375,903 @@ $('key-remove').addEventListener('click', async () => {
     toast('Key removed', true);
   } catch (err) { console.error(err); $('key-error').textContent = 'Could not remove it.'; }
 });
+
+/* ================================================================== *
+ * TEAM VISIBILITY BOARD
+ *
+ * One page per client project: what they asked for (the spec), what the
+ * project is made of (components), what has shipped, what is coming, and
+ * what is stuck. The model lives in docs/visibility.js, which is pure and
+ * tested; everything below is rendering and writes.
+ *
+ * The honesty rules this view is built around:
+ *   — Every card says when it was last touched, and says so loudly past a
+ *     fortnight. A visibility board nobody updates is worse than none,
+ *     because the team stops asking and starts believing it.
+ *   — "In production" is only ever what a human confirmed. Nothing here
+ *     infers it from a date or a status.
+ *   — A planned release shows its target and its blocker, or it does not
+ *     earn a place on the board.
+ * ================================================================== */
+
+/* ---------- the board ---------- */
+
+function visibleProjects() {
+  const q = state.vbQuery.trim().toLowerCase();
+  const byStatus = [...state.projects].sort(projectBoardOrder).filter((p) => {
+    if (state.vbStatus === 'open') return p.status === 'active' || p.status === 'paused';
+    if (!state.vbStatus) return true;
+    return p.status === state.vbStatus;
+  });
+  if (!q) return byStatus;
+  return byStatus.filter((p) => {
+    if ([p.name, p.client, p.summary].some((f) => (f || '').toLowerCase().includes(q))) return true;
+    if (componentsOf(state.components, p.id).some((c) => c.name.toLowerCase().includes(q))) return true;
+    return state.specs.some((s) => s.projectId === p.id
+      && [s.title, s.sourceName].some((f) => (f || '').toLowerCase().includes(q)));
+  });
+}
+
+function renderVisibility() {
+  renderMigrateBar();
+  const shown = visibleProjects();
+
+  if (!shown.length) {
+    $('vb-list').innerHTML = `<div class="tl-empty">${
+      state.projects.length
+        ? 'Nothing matches. Widen the status filter, or clear the search.'
+        : 'No projects yet.<br>A project is the client-facing unit — "Ocufii 2.0", "Safe Deposit Solutions". Its components are the deliverables inside it: the iOS build, the web portal.'
+    }</div>`;
+    return;
+  }
+
+  const today = todayDay();
+  const now = new Date();
+  $('vb-list').innerHTML = shown.map((p) => projectCardHtml(p, today, now)).join('');
+  wireBoardCards();
+}
+
+function projectCardHtml(p, today, now) {
+  const roll = projectRollup(p, {
+    components: state.components, releases: state.releases,
+    specs: state.specs, events: state.events, today
+  });
+  const fresh = freshness(projectTouchedAt(p, {
+    components: state.components, releases: state.releases,
+    specs: state.specs, events: state.events
+  }), now);
+  const open = state.vbOpen[p.id] !== false;   // expanded unless collapsed
+  // Staleness is only a warning on work that is supposed to be moving. A
+  // project that shipped in March is meant to look untouched; shouting about
+  // it is how a board teaches people to ignore its warnings.
+  const active = p.status === 'active' || p.status === 'paused';
+
+  return `
+    <section class="vb-card${open ? ' open' : ''}" data-pid="${esc(p.id)}">
+      <header class="vb-head">
+        <button class="vb-twist" data-twist="${esc(p.id)}" aria-label="${open ? 'Collapse' : 'Expand'}" aria-expanded="${open}">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+        </button>
+        <span class="v-dot" style="background:${esc(p.color)}"></span>
+        <h3 class="vb-name">${esc(p.name)}</h3>
+        ${p.client ? `<span class="vb-client">${esc(p.client)}</span>` : ''}
+        <span class="vb-status s-${esc(p.status)}">${esc(projectStatusLabel(p.status))}</span>
+        <span class="vb-fresh${fresh.stale && active ? ' stale' : ''}" title="Newest spec, release or event under this project">${esc(fresh.label)}</span>
+        <div class="spacer"></div>
+        <button class="btn-quiet compact" data-pedit="${esc(p.id)}">Edit</button>
+        <button class="btn-quiet compact" data-cadd="${esc(p.id)}">Add component</button>
+      </header>
+
+      ${p.summary ? `<p class="vb-summary">${esc(p.summary)}</p>` : ''}
+
+      <div class="vb-figures">
+        <span><b>${roll.components.length}</b> component${roll.components.length === 1 ? '' : 's'}</span>
+        <span><b>${roll.releases}</b> build${roll.releases === 1 ? '' : 's'} recorded</span>
+        <span><b>${roll.liveCount}</b> in production</span>
+        ${roll.plannedCount ? `<span><b>${roll.plannedCount}</b> planned</span>` : ''}
+        ${roll.lastShipped ? `<span>last shipped <b>${esc(dayLabel(roll.lastShipped))}</b></span>` : '<span class="quiet">nothing shipped yet</span>'}
+        ${roll.eventCount ? `<span><b>${roll.eventCount}</b> timeline event${roll.eventCount === 1 ? '' : 's'}</span>` : ''}
+      </div>
+
+      ${specRowHtml(p, roll)}
+
+      ${open ? `
+        ${roll.blocked.length ? `
+          <div class="vb-blocked">
+            <span class="vb-blocked-k">Blocked</span>
+            ${roll.blocked.map((r) => {
+              const c = componentById(state.components, r.componentId || r.appId);
+              return `
+              <button class="vb-block-row" data-redit="${esc(r.id)}">
+                <span class="vb-block-ver">${esc(releaseLabel(r))}</span>
+                ${c ? `<span class="vb-block-comp">${esc(c.name)}</span>` : ''}
+                <span class="vb-block-why">${esc(r.blocker || 'no reason recorded')}</span>
+                ${r.targetDate ? `<span class="vb-block-when">target ${esc(r.targetDate)}</span>` : ''}
+              </button>`;
+            }).join('')}
+          </div>` : ''}
+
+        ${roll.overdue.length ? `
+          <div class="vb-overdue">${roll.overdue.length} planned release${roll.overdue.length === 1 ? '' : 's'} past target — ${roll.overdue.map((r) => esc(`${releaseLabel(r)} (${r.targetDate})`)).join(', ')}</div>` : ''}
+
+        ${roll.perComponent.length
+          ? `<div class="vb-comps">${roll.perComponent.map((pc) => componentRowHtml(p, pc)).join('')}</div>`
+          : `<div class="vb-nocomp">No components yet. Add the deliverables — iOS, Android, the portal — and releases hang off those.</div>`}
+      ` : ''}
+    </section>`;
+}
+
+function specRowHtml(p, roll) {
+  const s = roll.spec;
+  if (!s) {
+    return `
+      <div class="vb-spec none">
+        <span class="vb-spec-k">Spec</span>
+        <span class="quiet">none uploaded</span>
+        <div class="spacer"></div>
+        <button class="btn-quiet compact" data-spadd="${esc(p.id)}">Upload .docx</button>
+      </div>`;
+  }
+  return `
+    <div class="vb-spec">
+      <span class="vb-spec-k">Spec</span>
+      <button class="vb-spec-open" data-spopen="${esc(s.id)}">${esc(s.title)}</button>
+      <span class="vb-spec-v">v${s.version}</span>
+      <span class="vb-spec-meta">${s.wordCount.toLocaleString()} words · ${esc(dayLabel((s.createdAt || '').slice(0, 10)))}</span>
+      <div class="spacer"></div>
+      <button class="btn-quiet compact" data-spadd="${esc(p.id)}">New version</button>
+    </div>`;
+}
+
+function componentRowHtml(p, pc) {
+  const c = pc.component;
+  const live = pc.inProduction;
+  const next = pc.nextPlanned;
+  return `
+    <div class="vb-comp" data-cid="${esc(c.id)}">
+      <div class="vb-comp-head">
+        <span class="v-dot" style="background:${esc(c.color)}"></span>
+        <span class="vb-comp-name">${esc(c.name)}</span>
+        <span class="rl-plat-tag">${esc(platformLabel(c.platform))}</span>
+        ${pc.blocked ? `<span class="vb-pill bad">${pc.blocked} blocked</span>` : ''}
+        <div class="spacer"></div>
+        <button class="btn-quiet compact" data-cedit="${esc(c.id)}">Edit</button>
+        <button class="btn-quiet compact" data-plan="${esc(c.id)}">Plan release</button>
+      </div>
+      <div class="vb-comp-grid">
+        <div class="vb-cell">
+          <span class="k">In production</span>
+          ${live
+            ? `<button class="vb-link" data-redit="${esc(live.id)}">${esc(releaseLabel(live))}</button>
+               <span class="vb-when">${esc(live.env || 'Production')} · ${esc(live.prodDate)}</span>`
+            : '<span class="quiet">nothing</span>'}
+        </div>
+        <div class="vb-cell">
+          <span class="k">Next planned</span>
+          ${next
+            ? `<button class="vb-link" data-redit="${esc(next.id)}">${esc(releaseLabel(next))}</button>
+               <span class="vb-when">${esc(releaseStatusLabel(releaseStatus(next)))} · target ${esc(next.targetDate || 'none')}</span>`
+            : '<span class="quiet">none</span>'}
+        </div>
+        <div class="vb-cell">
+          <span class="k">Builds recorded</span>
+          <span class="vb-num">${pc.total}</span>
+          ${pc.total
+            ? `<button class="vb-link quiet-link" data-conly="${esc(c.id)}">see them</button>`
+            : '<span class="vb-when">none yet</span>'}
+        </div>
+        <div class="vb-cell">
+          <span class="k">Spec</span>
+          ${pc.spec
+            ? `<button class="vb-link" data-spopen="${esc(pc.spec.id)}">${esc(pc.spec.title)} v${pc.spec.version}</button>`
+            : `<button class="vb-link quiet-link" data-spadd="${esc(p.id)}" data-spcomp="${esc(c.id)}">add one</button>`}
+        </div>
+      </div>
+    </div>`;
+}
+
+function wireBoardCards() {
+  const list = $('vb-list');
+  const on = (attr, fn) => list.querySelectorAll(`[data-${attr}]`).forEach((el) =>
+    el.addEventListener('click', (e) => { e.stopPropagation(); fn(el.dataset[attr], el); }));
+
+  on('twist', (id) => {
+    state.vbOpen[id] = state.vbOpen[id] === false;
+    renderVisibility();
+  });
+  on('pedit', (id) => openProject(id));
+  on('cadd', (id) => openComponent(null, id));
+  on('cedit', (id) => openComponent(id));
+  on('plan', (id) => openRelease(null, { ownerId: id, planned: true, status: 'planned', targetDate: todayDay() }));
+  on('redit', (id) => openRelease(id));
+  on('spadd', (id, el) => openSpecUpload(id, el.dataset.spcomp || ''));
+  on('spopen', (id) => openSpecReader(id));
+  // Jumping to the Releases view filtered to this component is the honest
+  // answer to "see them" — a second list on this card would be a third place
+  // the same releases are rendered.
+  on('conly', (id) => { state.rlApp = id; setView('releases'); });
+}
+
+/* ---------- the migration banner ---------- *
+ *
+ * Shown only while there is something to bring across, and it says exactly
+ * what it would do before it does anything.
+ */
+function renderMigrateBar() {
+  const bar = $('vb-migrate-bar');
+  if (!state.apps.length) { bar.classList.add('hidden'); bar.innerHTML = ''; return; }
+
+  const plan = planMigration({
+    apps: state.apps, projects: state.projects,
+    components: state.components, releases: state.releases
+  });
+  if (plan.empty) { bar.classList.add('hidden'); bar.innerHTML = ''; return; }
+
+  const { projectsCreated, componentsCreated, releasesLinked } = plan.counts;
+  bar.classList.remove('hidden');
+  bar.innerHTML = `
+    <span>You have ${state.apps.length} app${state.apps.length === 1 ? '' : 's'} recorded under Releases that are not on the board yet
+      — ${componentsCreated} component${componentsCreated === 1 ? '' : 's'},
+      ${projectsCreated} new project${projectsCreated === 1 ? '' : 's'},
+      ${releasesLinked} release${releasesLinked === 1 ? '' : 's'} to link.</span>
+    <div class="spacer"></div>
+    <button class="btn-primary compact" id="vb-migrate-go">Show me what it would do</button>`;
+  $('vb-migrate-go').addEventListener('click', openMigration);
+}
+
+/* ---------- project editor ---------- */
+
+function openProject(id) {
+  const p = id ? projectById(state.projects, id) : null;
+  const src = p || blankProject(state.projects.length);
+  state.pjEditingId = p ? id : null;
+  state.pjColor = src.color;
+
+  $('pj-heading').textContent = p ? `Edit ${p.name}` : 'New project';
+  $('pj-name').value = src.name || '';
+  $('pj-client').value = src.client || '';
+  $('pj-summary').value = src.summary || '';
+  $('pj-status').innerHTML = PROJECT_STATUSES
+    .map((s) => `<option value="${esc(s.key)}">${esc(s.label)}</option>`).join('');
+  $('pj-status').value = src.status || 'active';
+  $('pj-error').textContent = '';
+  $('pj-delete').classList.toggle('hidden', !p);
+  renderSwatches('pj-colors', 'pjColor');
+
+  $('pj-ov').classList.add('show');
+  $('pj-name').focus();
+}
+
+function renderSwatches(elId, stateKey) {
+  const box = $(elId);
+  box.innerHTML = PROJECT_PALETTE.map((c) =>
+    `<button class="cat-sw${c.toLowerCase() === (state[stateKey] || '').toLowerCase() ? ' on' : ''}" style="background:${c}" data-color="${c}" aria-label="Colour ${c}"></button>`).join('');
+  box.querySelectorAll('.cat-sw').forEach((b) => b.addEventListener('click', () => {
+    state[stateKey] = b.dataset.color;
+    renderSwatches(elId, stateKey);
+  }));
+}
+
+async function saveProject() {
+  const project = {
+    name: $('pj-name').value.trim(),
+    client: $('pj-client').value.trim(),
+    status: $('pj-status').value,
+    summary: $('pj-summary').value.trim(),
+    color: state.pjColor,
+    order: state.pjEditingId
+      ? (projectById(state.projects, state.pjEditingId)?.order || 0)
+      : nextProjectOrder(state.projects)
+  };
+  const check = validateProject(project, state.projects, state.pjEditingId);
+  if (!check.ok) { $('pj-error').textContent = check.error; return; }
+
+  const id = state.pjEditingId || uid('p');
+  const existing = projectById(state.projects, id);
+  try {
+    await setDoc(projectRef(id), {
+      ...projectBody(project),
+      createdAt: existing?.createdAt || new Date().toISOString()
+    });
+    $('pj-ov').classList.remove('show');
+    state.pjEditingId = null;
+    toast(existing ? 'Project saved' : 'Project created', true);
+  } catch (err) {
+    console.error(err);
+    $('pj-error').textContent = `Could not save: ${err?.message || err}`;
+  }
+}
+
+/**
+ * Deleting a project is the one destructive action on this view, so it names
+ * everything that would go with it. Timeline events are deliberately NOT
+ * deleted — they are a record of what happened, and they survive as
+ * unassigned rather than vanishing with the project they referred to.
+ */
+async function deleteProject(id) {
+  const p = projectById(state.projects, id);
+  if (!p) return;
+  const comps = componentsOf(state.components, id);
+  const compIds = new Set(comps.map((c) => c.id));
+  const rels = state.releases.filter((r) => compIds.has(r.componentId) || compIds.has(r.appId));
+  const specs = state.specs.filter((s) => s.projectId === id);
+  const events = state.events.filter((e) => e.projectId === id);
+
+  const parts = [
+    comps.length ? `${comps.length} component${comps.length === 1 ? '' : 's'}` : '',
+    rels.length ? `${rels.length} release${rels.length === 1 ? '' : 's'}` : '',
+    specs.length ? `${specs.length} spec version${specs.length === 1 ? '' : 's'}` : ''
+  ].filter(Boolean);
+
+  const ok = await askConfirm(
+    `${p.name} will be deleted${parts.length ? `, along with ${parts.join(', ')}` : ''}.`
+    + (events.length ? ` Its ${events.length} timeline event${events.length === 1 ? '' : 's'} will be kept, unassigned.` : '')
+    + ' There is no undo.',
+    'Delete project?'
+  );
+  if (!ok) return;
+
+  try {
+    const docs = [
+      ...rels.map((r) => releaseRef(r.id)),
+      ...specs.map((s) => specRef(s.id)),
+      ...comps.map((c) => componentRef(c.id))
+    ];
+    for (let i = 0; i < docs.length; i += 400) {
+      const batch = writeBatch(db);
+      docs.slice(i, i + 400).forEach((ref) => batch.delete(ref));
+      await batch.commit();
+    }
+    // Events keep their projectId pointing at a project that no longer exists,
+    // which the timeline already renders as "Unassigned". Clearing the field
+    // would be a second write per event for no gain.
+    await deleteDoc(projectRef(id));
+    $('pj-ov').classList.remove('show');
+    toast('Project deleted', true);
+  } catch (err) { console.error(err); toast('Could not delete the project'); }
+}
+
+/* ---------- component editor ---------- */
+
+function openComponent(id, projectId = '') {
+  const c = id ? componentById(state.components, id) : null;
+  const src = c || blankComponent(projectId, state.components.length);
+  state.cmEditingId = c ? id : null;
+  state.cmColor = src.color;
+
+  $('cm-heading').textContent = c ? `Edit ${c.name}` : 'New component';
+  $('cm-project').innerHTML = state.projects
+    .map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('')
+    || '<option value="">Create a project first</option>';
+  $('cm-project').value = src.projectId || projectId || state.projects[0]?.id || '';
+  $('cm-platform').innerHTML = PLATFORMS
+    .map((p) => `<option value="${esc(p.key)}">${esc(p.label)}</option>`).join('');
+  $('cm-platform').value = src.platform || 'ios';
+  $('cm-name').value = src.name || '';
+  $('cm-repo').value = src.repoUrl || '';
+  $('cm-artifact').value = src.artifactUrl || '';
+  $('cm-notes').value = src.notes || '';
+  $('cm-error').textContent = '';
+  $('cm-delete').classList.toggle('hidden', !c);
+  renderSwatches('cm-colors', 'cmColor');
+
+  $('cm-ov').classList.add('show');
+  $('cm-name').focus();
+}
+
+async function saveComponent() {
+  const comp = {
+    projectId: $('cm-project').value,
+    name: $('cm-name').value.trim(),
+    platform: $('cm-platform').value,
+    repoUrl: $('cm-repo').value.trim(),
+    artifactUrl: $('cm-artifact').value.trim(),
+    notes: $('cm-notes').value,
+    color: state.cmColor,
+    order: state.cmEditingId
+      ? (componentById(state.components, state.cmEditingId)?.order || 0)
+      : nextComponentOrder(state.components, $('cm-project').value)
+  };
+  const check = validateComponent(comp, state.components, state.cmEditingId);
+  if (!check.ok) { $('cm-error').textContent = check.error; return; }
+
+  const id = state.cmEditingId || uid('c');
+  const existing = componentById(state.components, id);
+  try {
+    await setDoc(componentRef(id), {
+      ...componentBody(comp),
+      createdAt: existing?.createdAt || new Date().toISOString()
+    });
+    $('cm-ov').classList.remove('show');
+    state.cmEditingId = null;
+    toast(existing ? 'Component saved' : 'Component added', true);
+  } catch (err) {
+    console.error(err);
+    $('cm-error').textContent = `Could not save: ${err?.message || err}`;
+  }
+}
+
+async function deleteComponent(id) {
+  const c = componentById(state.components, id);
+  if (!c) return;
+  const rels = releasesOf(state.releases, id);
+  const specs = state.specs.filter((s) => s.componentId === id);
+  const ok = await askConfirm(
+    `${c.name} will be deleted${rels.length ? `, along with its ${rels.length} release${rels.length === 1 ? '' : 's'}` : ''}${specs.length ? ` and ${specs.length} spec version${specs.length === 1 ? '' : 's'}` : ''}. There is no undo.`,
+    'Delete component?'
+  );
+  if (!ok) return;
+  try {
+    const docs = [...rels.map((r) => releaseRef(r.id)), ...specs.map((s) => specRef(s.id))];
+    for (let i = 0; i < docs.length; i += 400) {
+      const batch = writeBatch(db);
+      docs.slice(i, i + 400).forEach((ref) => batch.delete(ref));
+      await batch.commit();
+    }
+    await deleteDoc(componentRef(id));
+    if (state.rlApp === id) state.rlApp = '';
+    $('cm-ov').classList.remove('show');
+    toast('Component deleted', true);
+  } catch (err) { console.error(err); toast('Could not delete the component'); }
+}
+
+/* ---------- specs ---------- *
+ *
+ * A .docx is read in this tab by docs/docx.js — no server, no upload — and
+ * what gets stored is the prettified HTML plus the plain text the diff works
+ * on. Each upload is a new version; nothing is ever overwritten, because
+ * "what did the spec say in June" is the question this exists to answer.
+ */
+
+function openSpecUpload(projectId, componentId = '') {
+  state.spDraft = null;
+  $('sp-heading').textContent = 'Upload a spec';
+  $('sp-project').innerHTML = state.projects
+    .map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
+  $('sp-project').value = projectId || state.projects[0]?.id || '';
+  fillSpecComponentSelect(componentId);
+  $('sp-title').value = '';
+  $('sp-error').textContent = '';
+  $('sp-save').disabled = true;
+  ['sp-stat', 'sp-diff', 'sp-preview'].forEach((id) => {
+    $(id).classList.add('hidden');
+    $(id).innerHTML = '';
+  });
+  $('sp-ov').classList.add('show');
+}
+
+function fillSpecComponentSelect(selected) {
+  const pid = $('sp-project').value;
+  const comps = componentsOf(state.components, pid);
+  $('sp-component').innerHTML = '<option value="">The whole project</option>'
+    + comps.map((c) => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join('');
+  $('sp-component').value = comps.some((c) => c.id === selected) ? selected : '';
+}
+
+async function takeSpecFile(file) {
+  if (!file) return;
+  const nameOk = /\.docx$/i.test(file.name || '');
+  if (!nameOk) {
+    $('sp-error').textContent = 'That needs to be a .docx. A .doc or a PDF cannot be read in the browser — save it as .docx from Word first.';
+    return;
+  }
+  $('sp-error').textContent = '';
+  $('sp-stat').classList.remove('hidden');
+  $('sp-stat').textContent = `Reading ${file.name}…`;
+
+  let doc;
+  try {
+    doc = await readDocx(file);
+  } catch (err) {
+    console.error(err);
+    $('sp-stat').classList.add('hidden');
+    $('sp-error').textContent = `Could not read that document: ${err?.message || err}`;
+    return;
+  }
+
+  const outline = doc.toc.map((h) => h.text);
+  state.spDraft = {
+    html: doc.html,
+    text: doc.text,
+    outline,
+    words: doc.words,
+    sourceName: file.name
+  };
+
+  // The document's own first heading is a better title than its filename,
+  // which is usually a date and a revision letter.
+  if (!$('sp-title').value.trim()) {
+    $('sp-title').value = (doc.toc[0]?.text || file.name.replace(/\.docx$/i, '')).slice(0, 200);
+  }
+
+  const pid = $('sp-project').value;
+  const cid = $('sp-component').value;
+  const prev = currentSpec(state.specs, pid, cid);
+  const version = nextSpecVersion(state.specs, pid, cid);
+
+  $('sp-stat').innerHTML = `
+    <b>${doc.words.toLocaleString()}</b> words · <b>${outline.length}</b> heading${outline.length === 1 ? '' : 's'}
+    · saving as <b>version ${version}</b>${prev ? ` (replacing v${prev.version} as current)` : ''}`;
+
+  renderSpecDiff(prev);
+
+  $('sp-preview').classList.remove('hidden');
+  $('sp-preview').innerHTML = doc.html;
+  $('sp-save').disabled = false;
+}
+
+function renderSpecDiff(prev) {
+  const box = $('sp-diff');
+  if (!prev || !state.spDraft) { box.classList.add('hidden'); box.innerHTML = ''; return; }
+
+  const d = diffSpecs(prev, state.spDraft);
+  box.classList.remove('hidden');
+  if (d.identical) {
+    box.innerHTML = `<div class="sp-diff-head">No change from v${prev.version}. Saving it would add a version that says nothing new.</div>`;
+    return;
+  }
+  const hunks = diffHunks(d, 1);
+  box.innerHTML = `
+    <div class="sp-diff-head">
+      <b>${d.added}</b> paragraph${d.added === 1 ? '' : 's'} added,
+      <b>${d.removed}</b> removed, against v${prev.version}
+      ${d.truncated ? ' · document too long for an in-place diff, so moves show as a removal and an addition' : ''}
+    </div>
+    ${hunks.map(diffRowHtml).join('')}`;
+}
+
+function diffRowHtml(row) {
+  if (row.kind === 'gap') return `<div class="sp-gap">… ${row.count} unchanged paragraph${row.count === 1 ? '' : 's'}</div>`;
+  const cls = row.kind === 'added' ? 'add' : row.kind === 'removed' ? 'del' : 'same';
+  const mark = row.kind === 'added' ? '+' : row.kind === 'removed' ? '−' : ' ';
+
+  // docs/docx.js writes the plain text with markdown-ish markers — '## ' for a
+  // heading, '- ' for a list item — because the diff has to see a heading
+  // change as a change. They are stripped here and expressed as styling, so
+  // the diff reads like the document rather than like a file.
+  const raw = row.text || '';
+  const head = raw.match(/^(#{1,6})\s+(.*)$/);
+  const bullet = raw.match(/^(\s*)-\s+(.*)$/);
+  let shape = '';
+  let text = raw;
+  if (head) { shape = ` h${head[1].length}`; text = head[2]; }
+  else if (bullet) { shape = ' bullet'; text = bullet[2]; }
+
+  return `<div class="sp-row ${cls}${shape}"><span class="m">${mark}</span><span class="t">${esc(text)}</span></div>`;
+}
+
+async function saveSpec() {
+  if (!state.spDraft) return;
+  const pid = $('sp-project').value;
+  const cid = $('sp-component').value;
+  const spec = {
+    projectId: pid,
+    componentId: cid,
+    title: $('sp-title').value.trim(),
+    html: state.spDraft.html,
+    text: state.spDraft.text,
+    outline: state.spDraft.outline,
+    wordCount: state.spDraft.words,
+    sourceName: state.spDraft.sourceName,
+    version: nextSpecVersion(state.specs, pid, cid)
+  };
+  const check = validateSpec(spec);
+  if (!check.ok) { $('sp-error').textContent = check.error; return; }
+
+  $('sp-save').disabled = true;
+  try {
+    await setDoc(specRef(uid('s')), {
+      ...specBody(spec),
+      createdAt: new Date().toISOString()
+    });
+    $('sp-ov').classList.remove('show');
+    state.spDraft = null;
+    toast(`Spec saved as version ${spec.version}`, true);
+  } catch (err) {
+    console.error(err);
+    $('sp-error').textContent = `Could not save: ${err?.message || err}`;
+    $('sp-save').disabled = false;
+  }
+}
+
+/* ---------- the spec reader ---------- */
+
+function openSpecReader(specId) {
+  state.spvSpecId = specId;
+  state.spvDiff = false;
+  renderSpecReader();
+  $('spv-ov').classList.add('show');
+}
+
+function renderSpecReader() {
+  const s = state.specs.find((x) => x.id === state.spvSpecId);
+  if (!s) { $('spv-ov').classList.remove('show'); return; }
+
+  const p = projectById(state.projects, s.projectId);
+  const c = s.componentId ? componentById(state.components, s.componentId) : null;
+  const siblings = specsOf(state.specs, s.projectId, s.componentId);
+  const idx = siblings.findIndex((x) => x.id === s.id);
+  const prev = siblings[idx + 1] || null;   // siblings are newest-first
+
+  $('spv-heading').textContent = `${s.title}${c ? ` — ${c.name}` : p ? ` — ${p.name}` : ''}`;
+  $('spv-version').innerHTML = siblings
+    .map((x) => `<option value="${esc(x.id)}">Version ${x.version}${x === siblings[0] ? ' (current)' : ''}</option>`).join('');
+  $('spv-version').value = s.id;
+  $('spv-meta').textContent = `${s.wordCount.toLocaleString()} words · from ${s.sourceName || 'a Word document'} · uploaded ${dayLabel((s.createdAt || '').slice(0, 10))}`;
+
+  const diffBtn = $('spv-diff');
+  diffBtn.disabled = !prev;
+  diffBtn.textContent = state.spvDiff ? 'Read the document' : (prev ? `Changes from v${prev.version}` : 'No earlier version');
+  diffBtn.classList.toggle('on', state.spvDiff);
+
+  const rail = $('spv-outline');
+  rail.innerHTML = s.outline.length
+    ? s.outline.map((h, i) => `<button data-jump="${i}">${esc(h)}</button>`).join('')
+    : '<span class="quiet">No headings in this document.</span>';
+
+  const body = $('spv-body');
+  if (state.spvDiff && prev) {
+    const d = diffSpecs(prev, s);
+    body.innerHTML = d.identical
+      ? `<div class="sp-diff-head">Identical to v${prev.version}.</div>`
+      : `<div class="sp-diff-head"><b>${d.added}</b> added, <b>${d.removed}</b> removed against v${prev.version}</div>`
+        + diffHunks(d, 1).map(diffRowHtml).join('');
+  } else {
+    // The spec's own HTML, written by docs/docx.js from the .docx. It is
+    // escaped at render time there, which is why it can be assigned here.
+    body.innerHTML = s.html;
+  }
+
+  rail.querySelectorAll('[data-jump]').forEach((b) => b.addEventListener('click', () => {
+    if (state.spvDiff) { state.spvDiff = false; renderSpecReader(); }
+    const heads = $('spv-body').querySelectorAll('h1,h2,h3,h4');
+    const target = heads[Number(b.dataset.jump)];
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }));
+}
+
+async function deleteSpecVersion() {
+  const s = state.specs.find((x) => x.id === state.spvSpecId);
+  if (!s) return;
+  const ok = await askConfirm(
+    `Version ${s.version} of "${s.title}" will be deleted. The other versions are untouched. There is no undo.`,
+    'Delete this version?'
+  );
+  if (!ok) return;
+  try {
+    await deleteDoc(specRef(s.id));
+    const left = specsOf(state.specs, s.projectId, s.componentId).filter((x) => x.id !== s.id);
+    if (left.length) { state.spvSpecId = left[0].id; renderSpecReader(); }
+    else $('spv-ov').classList.remove('show');
+    toast('Version deleted', true);
+  } catch (err) { console.error(err); toast('Could not delete that version'); }
+}
+
+/* ---------- what's live where ---------- */
+
+function openLiveMatrix() {
+  const comps = state.components.length
+    ? state.components
+    : state.apps.map((a) => ({ ...a }));
+  const m = liveMatrix(comps, state.releases);
+  const box = $('lv-body');
+
+  if (!m.envs.length) {
+    box.innerHTML = '<div class="tl-empty">Nothing is marked as being in production yet.<br>Tick "pushed to production" on a release and it appears here.</div>';
+  } else {
+    box.innerHTML = `
+      <table class="lv-table">
+        <thead>
+          <tr><th>Component</th>${m.envs.map((e) => `<th>${esc(e)}</th>`).join('')}</tr>
+        </thead>
+        <tbody>
+          ${m.rows.filter((r) => r.cells.some((c) => c.release)).map((r) => `
+            <tr>
+              <th scope="row">
+                <span class="v-dot" style="background:${esc(r.component.color || 'var(--ink-3)')}"></span>
+                ${esc(r.component.name)}
+              </th>
+              ${r.cells.map((c) => `
+                <td>${c.release
+                  ? `<span class="lv-ver">${esc(releaseLabel(c.release))}</span><span class="lv-when">${esc(c.release.prodDate)}</span>`
+                  : '<span class="quiet">—</span>'}</td>`).join('')}
+            </tr>`).join('')}
+        </tbody>
+      </table>
+      <p class="att-hint">Each cell is the newest release marked as in production for that environment — not the newest build.</p>`;
+  }
+  $('lv-ov').classList.add('show');
+}
+
+/* ---------- migration ---------- *
+ *
+ * 33 live releases sit behind this, so: it shows the whole plan first, it
+ * creates rather than moves (the `apps` documents and every `appId` stay
+ * exactly where they are), and running it twice does nothing the second time.
+ */
+
+function openMigration() {
+  const plan = planMigration({
+    apps: state.apps, projects: state.projects,
+    components: state.components, releases: state.releases
+  });
+  state.mgPlan = plan;
+
+  $('mg-error').textContent = '';
+  $('mg-intro').textContent = 'Nothing is deleted or moved. Your apps stay where they are and every release keeps the app it already points at — this adds the board\'s own records alongside them, so you can stop at any point without breaking the Releases view.';
+
+  const rows = [];
+  plan.projects.filter((p) => p.action === 'create').forEach((p) => rows.push(`
+    <div class="mg-row">
+      <span class="mg-tag new">new project</span>
+      <span class="v-dot" style="background:${esc(p.color)}"></span>
+      <span class="mg-name">${esc(p.name)}</span>
+    </div>`));
+
+  plan.components.forEach((c) => rows.push(`
+    <div class="mg-row">
+      <span class="mg-tag ${c.action === 'create' ? 'new' : 'keep'}">${c.action === 'create' ? 'new component' : 'already there'}</span>
+      <span class="mg-name">${esc(c.name)}</span>
+      <span class="mg-arrow">under</span>
+      <span class="mg-proj">${esc(c.projectName)}</span>
+      <span class="rl-plat-tag">${esc(platformLabel(c.platform))}</span>
+    </div>`));
+
+  const byComp = new Map();
+  plan.releases.forEach((r) => {
+    byComp.set(r.componentName, (byComp.get(r.componentName) || 0) + 1);
+  });
+  [...byComp.entries()].forEach(([name, n]) => rows.push(`
+    <div class="mg-row">
+      <span class="mg-tag link">link</span>
+      <span class="mg-name">${n} release${n === 1 ? '' : 's'}</span>
+      <span class="mg-arrow">to</span>
+      <span class="mg-proj">${esc(name)}</span>
+    </div>`));
+
+  if (plan.counts.releasesAlreadyLinked) rows.push(`
+    <div class="mg-row quiet">
+      <span class="mg-tag keep">skip</span>
+      <span class="mg-name">${plan.counts.releasesAlreadyLinked} release${plan.counts.releasesAlreadyLinked === 1 ? '' : 's'} already linked</span>
+    </div>`);
+
+  $('mg-plan').innerHTML = rows.join('')
+    + (plan.warnings.length
+      ? `<div class="mg-warn">${plan.warnings.map((w) => `<p>${esc(w)}</p>`).join('')}</div>`
+      : '');
+
+  $('mg-run').disabled = plan.empty;
+  $('mg-run').textContent = plan.empty ? 'Nothing to do' : 'Do it';
+  $('mg-ov').classList.add('show');
+}
+
+async function runMigration() {
+  const plan = state.mgPlan;
+  if (!plan || plan.empty) return;
+  $('mg-run').disabled = true;
+  $('mg-run').textContent = 'Working…';
+
+  const writes = migrationWrites(plan, { today: todayDay() });
+  const resolved = new Map();   // plan ref → real document id
+  let done = 0;
+
+  try {
+    // Projects and components are written one at a time rather than batched:
+    // each component needs the real id of the project written before it, and
+    // a batch gives nothing back until it commits. There are a handful of
+    // these; the releases, of which there are many, are batched below.
+    for (const w of writes.filter((x) => x.collection === 'projects')) {
+      const id = uid('p');
+      await setDoc(projectRef(id), w.data);
+      resolved.set(w.ref, id);
+      done += 1;
+    }
+    for (const w of writes.filter((x) => x.collection === 'components')) {
+      const id = uid('c');
+      const projectId = resolved.get(w.projectRef) || w.projectRef;
+      await setDoc(componentRef(id), { ...w.data, projectId });
+      resolved.set(w.ref, id);
+      done += 1;
+    }
+    const relWrites = writes.filter((x) => x.collection === 'releases');
+    for (let i = 0; i < relWrites.length; i += 400) {
+      const batch = writeBatch(db);
+      relWrites.slice(i, i + 400).forEach((w) => {
+        batch.update(releaseRef(w.id), { componentId: resolved.get(w.componentRef) || w.componentRef });
+        done += 1;
+      });
+      await batch.commit();
+    }
+
+    state.mgPlan = null;
+    $('mg-ov').classList.remove('show');
+    toast(`Board populated — ${done} record${done === 1 ? '' : 's'} written`, true);
+  } catch (err) {
+    console.error(err);
+    // Partial progress is safe and resumable: re-opening the plan shows only
+    // what is left, because planMigration skips what already exists.
+    $('mg-error').textContent = `Stopped after ${done} write${done === 1 ? '' : 's'}: ${err?.message || err}. Nothing was deleted — close this and reopen it to carry on from where it stopped.`;
+    $('mg-run').disabled = false;
+    $('mg-run').textContent = 'Carry on';
+  }
+}
+
+/* ---------- visibility wiring ---------- */
+
+$('vb-search').addEventListener('input', () => { state.vbQuery = $('vb-search').value; renderVisibility(); });
+$('vb-status').addEventListener('change', () => { state.vbStatus = $('vb-status').value; renderVisibility(); });
+$('vb-new').addEventListener('click', () => openProject(null));
+$('vb-live').addEventListener('click', openLiveMatrix);
+
+const closeOv = (ovId) => () => $(ovId).classList.remove('show');
+const backdrop = (ovId, fn) => $(ovId).addEventListener('click', (e) => { if (e.target.id === ovId) fn(); });
+
+$('pj-x').addEventListener('click', closeOv('pj-ov'));
+$('pj-cancel').addEventListener('click', closeOv('pj-ov'));
+$('pj-save').addEventListener('click', saveProject);
+$('pj-delete').addEventListener('click', () => { if (state.pjEditingId) deleteProject(state.pjEditingId); });
+backdrop('pj-ov', closeOv('pj-ov'));
+$('pj-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); saveProject(); } });
+
+$('cm-x').addEventListener('click', closeOv('cm-ov'));
+$('cm-cancel').addEventListener('click', closeOv('cm-ov'));
+$('cm-save').addEventListener('click', saveComponent);
+$('cm-delete').addEventListener('click', () => { if (state.cmEditingId) deleteComponent(state.cmEditingId); });
+backdrop('cm-ov', closeOv('cm-ov'));
+
+$('sp-x').addEventListener('click', closeOv('sp-ov'));
+$('sp-cancel').addEventListener('click', closeOv('sp-ov'));
+$('sp-save').addEventListener('click', saveSpec);
+backdrop('sp-ov', closeOv('sp-ov'));
+$('sp-pick').addEventListener('click', () => $('sp-file').click());
+$('sp-file').addEventListener('change', async (e) => {
+  const f = e.target.files?.[0];
+  e.target.value = '';
+  await takeSpecFile(f);
+});
+// Changing where the spec goes changes which version number it gets and what
+// it is diffed against, so the preview is recomputed rather than left stale.
+$('sp-project').addEventListener('change', () => {
+  fillSpecComponentSelect('');
+  if (state.spDraft) refreshSpecDraftTargets();
+});
+$('sp-component').addEventListener('change', () => { if (state.spDraft) refreshSpecDraftTargets(); });
+['dragenter', 'dragover'].forEach((t) => $('sp-drop').addEventListener(t, (e) => {
+  e.preventDefault(); $('sp-drop').classList.add('over');
+}));
+['dragleave', 'drop'].forEach((t) => $('sp-drop').addEventListener(t, () => $('sp-drop').classList.remove('over')));
+$('sp-drop').addEventListener('drop', async (e) => {
+  e.preventDefault();
+  await takeSpecFile(e.dataTransfer?.files?.[0]);
+});
+
+function refreshSpecDraftTargets() {
+  const pid = $('sp-project').value;
+  const cid = $('sp-component').value;
+  const prev = currentSpec(state.specs, pid, cid);
+  const version = nextSpecVersion(state.specs, pid, cid);
+  $('sp-stat').innerHTML = `
+    <b>${state.spDraft.words.toLocaleString()}</b> words · <b>${state.spDraft.outline.length}</b> heading${state.spDraft.outline.length === 1 ? '' : 's'}
+    · saving as <b>version ${version}</b>${prev ? ` (replacing v${prev.version} as current)` : ''}`;
+  renderSpecDiff(prev);
+}
+
+$('spv-x').addEventListener('click', closeOv('spv-ov'));
+backdrop('spv-ov', closeOv('spv-ov'));
+$('spv-version').addEventListener('change', () => {
+  state.spvSpecId = $('spv-version').value;
+  state.spvDiff = false;
+  renderSpecReader();
+});
+$('spv-diff').addEventListener('click', () => { state.spvDiff = !state.spvDiff; renderSpecReader(); });
+$('spv-delete').addEventListener('click', deleteSpecVersion);
+
+$('lv-x').addEventListener('click', closeOv('lv-ov'));
+backdrop('lv-ov', closeOv('lv-ov'));
+
+$('mg-x').addEventListener('click', closeOv('mg-ov'));
+$('mg-cancel').addEventListener('click', closeOv('mg-ov'));
+$('mg-run').addEventListener('click', runMigration);
+backdrop('mg-ov', closeOv('mg-ov'));
+
+$('rl-planned').addEventListener('change', syncPlanned);

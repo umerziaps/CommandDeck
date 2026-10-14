@@ -48,9 +48,30 @@ service cloud.firestore {
         allow create, update: if isOwner(userId) && validEvent();
       }
 
+      // Projects are shared between the timeline and the visibility board.
+      // The board added client/status/summary/order; a project written by the
+      // old timeline code has none of them, which is why they are all optional.
       match /projects/{projectId} {
         allow read, delete: if isOwner(userId);
         allow create, update: if isOwner(userId) && validProject();
+      }
+
+      // ---- team visibility board ----
+      //
+      // Components are the deliverables inside a project — the iOS build, the
+      // web portal. They succeed `apps`, which is left in place: the migration
+      // copies, it does not move, so a half-finished run is not a broken board.
+      match /components/{componentId} {
+        allow read, delete: if isOwner(userId);
+        allow create, update: if isOwner(userId) && validComponent();
+      }
+
+      // Specs are prettified Word documents. Plaintext, and often the most
+      // commercially sensitive thing on the board — a client's unreleased
+      // requirements. These rules are the only thing protecting them.
+      match /specs/{specId} {
+        allow read, delete: if isOwner(userId);
+        allow create, update: if isOwner(userId) && validSpec();
       }
 
       // ---- credentials vault ----
@@ -160,13 +181,27 @@ service cloud.firestore {
           && d.env is string && d.env.size() <= 120
           && d.changes is string && d.changes.size() <= 20000
           && d.sourceUrl is string && d.artifactUrl is string
-          && d.buildDate is string && d.buildDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+          // A planned release has not been built yet, so it is the one case
+          // where buildDate is allowed to be empty.
+          && d.buildDate is string
+          && (d.buildDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+              || (d.keys().hasAny(['planned']) && d.planned == true && d.buildDate == ''))
           // The flag is a real boolean, so a truthy string cannot mark
           // something as shipped, and a shipped release carries its date.
           && d.production is bool
           && (d.production == false ? d.prodDate == '' : d.prodDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$'))
           && d.notes is string && d.notes.size() <= 20000
-          && d.createdAt is string && d.updatedAt is string;
+          && d.createdAt is string && d.updatedAt is string
+          // Board fields, all optional. `componentId` is what the migration
+          // adds; `appId` above is deliberately still required, so a release
+          // always remains readable by a client that predates the board.
+          && (!d.keys().hasAny(['componentId']) || d.componentId is string)
+          && (!d.keys().hasAny(['planned']) || d.planned is bool)
+          && (!d.keys().hasAny(['targetDate'])
+              || d.targetDate == '' || d.targetDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$'))
+          && (!d.keys().hasAny(['status'])
+              || d.status in ['planned', 'building', 'qa', 'released', 'live', 'blocked', 'cancelled'])
+          && (!d.keys().hasAny(['blocker']) || (d.blocker is string && d.blocker.size() <= 500));
     }
 
     function validEvent() {
@@ -185,6 +220,44 @@ service cloud.firestore {
       let d = request.resource.data;
       return d.name is string && d.name.size() > 0 && d.name.size() <= 80
           && d.color is string && d.color.matches('^#[0-9A-Fa-f]{6}$')
+          && d.createdAt is string
+          // Board fields, all optional: a project created by the timeline has
+          // none of them, and rejecting those would break the timeline.
+          && (!d.keys().hasAny(['client']) || (d.client is string && d.client.size() <= 80))
+          && (!d.keys().hasAny(['status'])
+              || d.status in ['active', 'paused', 'shipped', 'archived'])
+          && (!d.keys().hasAny(['summary']) || (d.summary is string && d.summary.size() <= 300))
+          && (!d.keys().hasAny(['order']) || d.order is number);
+    }
+
+    function validComponent() {
+      let d = request.resource.data;
+      return d.projectId is string && d.projectId.size() > 0
+          && d.name is string && d.name.size() > 0 && d.name.size() <= 80
+          && d.platform in ['ios', 'android', 'web', 'portal', 'backend', 'other']
+          && d.repoUrl is string && d.repoUrl.size() <= 2000
+          && d.artifactUrl is string && d.artifactUrl.size() <= 2000
+          && d.notes is string && d.notes.size() <= 20000
+          && d.color is string && d.color.matches('^#[0-9A-Fa-f]{6}$')
+          && d.order is number
+          && d.createdAt is string;
+    }
+
+    // A spec is one version of one document. Versions are never edited, only
+    // superseded, so `version` must be a positive integer and the body sizes
+    // are capped at what the client refuses to upload anyway — the cap is here
+    // too, because a cap enforced only in the client is not a cap.
+    function validSpec() {
+      let d = request.resource.data;
+      return d.projectId is string && d.projectId.size() > 0
+          && d.componentId is string
+          && d.title is string && d.title.size() > 0 && d.title.size() <= 200
+          && d.html is string && d.html.size() > 0 && d.html.size() <= 400000
+          && d.text is string && d.text.size() <= 200000
+          && d.outline is list && d.outline.size() <= 200
+          && d.wordCount is number
+          && d.sourceName is string && d.sourceName.size() <= 300
+          && d.version is int && d.version >= 1
           && d.createdAt is string;
     }
 

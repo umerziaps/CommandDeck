@@ -35,10 +35,15 @@
 
 import { isDayString, todayDay } from './timeline.js';
 
+/* The canonical platform list for the whole app. docs/visibility.js imports it
+ * and adds grouping metadata; nothing defines a second copy, because a key
+ * that exists in one list and not the other silently rewrites itself to
+ * 'other' the next time the document is read. */
 export const PLATFORMS = [
-  { key: 'android', label: 'Android' },
   { key: 'ios', label: 'iOS' },
-  { key: 'web', label: 'Web' },
+  { key: 'android', label: 'Android' },
+  { key: 'web', label: 'Website' },
+  { key: 'portal', label: 'Web Portal' },
   { key: 'backend', label: 'Backend' },
   { key: 'other', label: 'Other' }
 ];
@@ -102,17 +107,36 @@ export const appById = (apps, id) => apps.find((a) => a.id === id) || null;
 
 export function blankRelease(appId = '', today = todayDay()) {
   return {
+    // componentId is deliberately absent: normaliseRelease derives it from
+    // appId, so a blank release has one owner, not two that can drift apart.
     appId, version: '', build: '', env: '', changes: '',
     sourceUrl: '', artifactUrl: '', buildDate: today,
-    production: false, prodDate: '', notes: ''
+    production: false, prodDate: '', notes: '',
+    // Board fields. A release recorded after the fact is not planned; the
+    // planned path sets these itself. See docs/visibility.js for what they mean.
+    planned: false, targetDate: '', status: '', blocker: ''
   };
 }
 
 export function normaliseRelease(id, d = {}) {
   const str = (v) => (typeof v === 'string' ? v : '');
+  // A release carries both owner keys: `appId` is what every release written
+  // before the board has, `componentId` is what the board reads. Whichever is
+  // present fills the other, so one object is readable by both paths and a
+  // half-migrated database has no releases that belong to nothing.
+  const appId = str(d.appId) || str(d.componentId);
+  const componentId = str(d.componentId) || appId;
+  const planned = d.planned === true;
   return {
     id,
-    appId: str(d.appId),
+    appId,
+    componentId,
+    planned,
+    targetDate: isDayString(d.targetDate) ? d.targetDate : '',
+    // Free of inference on purpose: an unknown status reads back as empty and
+    // docs/visibility.js derives one. Storing a guess would make it permanent.
+    status: str(d.status),
+    blocker: str(d.blocker),
     version: str(d.version),
     build: str(d.build),
     env: str(d.env),
@@ -137,9 +161,24 @@ export function releaseBody(r) {
 }
 
 export function validateRelease(r) {
-  if (!(r?.appId || '').trim()) return { ok: false, error: 'Pick which app this is.' };
+  if (!(r?.appId || '').trim() && !(r?.componentId || '').trim()) {
+    return { ok: false, error: 'Pick which app this is.' };
+  }
   if (!(r?.version || '').trim() && !(r?.build || '').trim()) {
     return { ok: false, error: 'Give it a version or a build number.' };
+  }
+  // A planned release has a target, not a build date — it has not been built.
+  if (r?.planned === true) {
+    if (r?.production === true) {
+      return { ok: false, error: 'A release cannot be both planned and already in production.' };
+    }
+    if (!isDayString(r?.targetDate)) {
+      return { ok: false, error: 'A planned release needs a target date — that is the whole point of showing it.' };
+    }
+    if ((r?.blocker || '').length > 500) {
+      return { ok: false, error: 'Keep the blocker to 500 characters — it is a line on a card.' };
+    }
+    return { ok: true };
   }
   if (!isDayString(r?.buildDate)) return { ok: false, error: 'Pick the build date.' };
   if (r?.production && !isDayString(r?.prodDate)) {
@@ -172,10 +211,24 @@ export const releaseOrder = (a, b) => {
   return String(b.build || '').localeCompare(String(a.build || ''), undefined, { numeric: true });
 };
 
-export function filterReleases(releases, { appId = '', env = '', prodOnly = false, query = '' } = {}) {
+/**
+ * Which app or component a release belongs to.
+ *
+ * Both keys are checked because a release written before the visibility board
+ * has only `appId`, one written after it has `componentId`, and a migrated one
+ * has both pointing at different documents. Matching either is what keeps a
+ * half-migrated database from hiding half the releases.
+ */
+export const ownsRelease = (r, ownerId) =>
+  r?.appId === ownerId || r?.componentId === ownerId;
+
+export function filterReleases(releases, { appId = '', env = '', prodOnly = false, query = '', includePlanned = false } = {}) {
   const q = query.trim().toLowerCase();
   return releases.filter((r) => {
-    if (appId && r.appId !== appId) return false;
+    // A planned release is not a build. It belongs on the visibility board,
+    // where the question is what is coming; this list answers what happened.
+    if (!includePlanned && r.planned === true) return false;
+    if (appId && !ownsRelease(r, appId)) return false;
     if (env && (r.env || '').toLowerCase() !== env.toLowerCase()) return false;
     if (prodOnly && !r.production) return false;
     if (q && !['version', 'build', 'env', 'changes', 'notes']
@@ -197,12 +250,14 @@ export function environments(releases) {
 /** The newest release of each app that actually reached production. */
 export function latestInProduction(releases, appId) {
   return releases
-    .filter((r) => r.appId === appId && r.production)
+    .filter((r) => ownsRelease(r, appId) && r.production)
     .sort((a, b) => String(b.prodDate || '').localeCompare(String(a.prodDate || '')))[0] || null;
 }
 
 export function appSummary(releases, appId) {
-  const mine = releases.filter((r) => r.appId === appId);
+  // Planned releases are excluded: "built since" is a count of builds, and a
+  // release that has not been built yet would inflate it.
+  const mine = releases.filter((r) => ownsRelease(r, appId) && r.planned !== true);
   const prod = latestInProduction(releases, appId);
   const latest = [...mine].sort(releaseOrder)[0] || null;
   return {
@@ -483,7 +538,7 @@ export function parseBuildEmail(raw, { defaultDate = '' } = {}) {
  */
 export function dedupeReleases(parsed, existing, appId) {
   const key = (r) => `${(r.version || '').toLowerCase()}|${(r.build || '').toLowerCase()}|${(r.env || '').toLowerCase()}`;
-  const have = new Set(existing.filter((r) => r.appId === appId).map(key));
+  const have = new Set(existing.filter((r) => ownsRelease(r, appId)).map(key));
   const seen = new Set();
   const fresh = [];
   let skipped = 0;

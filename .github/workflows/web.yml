@@ -129,7 +129,32 @@ jobs:
         if: env.SERVICE_ACCOUNT == ''
         run: |
           echo "::notice::Skipped — add the FIREBASE_SERVICE_ACCOUNT secret to enable Firebase Hosting deploys. See CI-CD.md."
+  # Rules live in the repo but deployed by hand, so they drifted and group
+  # creation broke in production while every test passed. They go up with
+  # every push now.
+  deploy-rules:
+    name: Publish Firestore rules
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
 
+    env:
+      SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish firestore.rules
+        if: env.SERVICE_ACCOUNT != ''
+        run: |
+          printf '%s' "$SERVICE_ACCOUNT" > "$RUNNER_TEMP/sa.json"
+          export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/sa.json"
+          npx --yes firebase-tools@15 deploy --only firestore:rules \
+            --project "${{ secrets.FIREBASE_PROJECT_ID }}" --non-interactive
+
+      - name: Explain the skip
+        if: env.SERVICE_ACCOUNT == ''
+        run: echo "::notice::Skipped — add FIREBASE_SERVICE_ACCOUNT to publish rules automatically."
   # ---------------------------------------------------------------------
   # 3. PREVIEW DEPLOY FOR PULL REQUESTS
   #
